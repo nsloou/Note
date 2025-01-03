@@ -656,8 +656,8 @@ d-i clock-setup/ntp boolean false
 
 d-i preseed/early_command string anna-install libfuse2-udeb fuse-udeb ntfs-3g-udeb libcrypto1.1-udeb libpcre2-8-0-udeb libssl1.1-udeb libuuid1-udeb zlib1g-udeb wget-udeb
 d-i partman/early_command string [[ -n "\$(blkid -t TYPE='vfat' -o device)" ]] && umount "\$(blkid -t TYPE='vfat' -o device)"; \
-debconf-set partman-auto/disk "\$(list-devices disk |head -n1)"; \
-wget -qO- '$DDURL' |gunzip -dc |/bin/dd of=\$(list-devices disk |head -n1); \
+debconf-set partman-auto/disk "/dev/vda"; \
+wget -qO- '$DDURL' |gunzip -dc |/bin/dd of=/dev/vda; \
 mount.ntfs-3g \$(list-devices partition |head -n1) /mnt; \
 cd '/mnt/ProgramData/Microsoft/Windows/Start Menu/Programs'; \
 cd Start* || cd start*; \
@@ -689,7 +689,7 @@ d-i apt-setup/services-select multiselect
 popularity-contest popularity-contest/participate boolean false
 
 d-i grub-installer/only_debian boolean true
-d-i grub-installer/bootdev string $IncDisk
+d-i grub-installer/bootdev string /dev/vda
 d-i grub-installer/force-efi-extra-removable boolean true
 d-i finish-install/reboot_in_progress note
 d-i debian-installer/exit/reboot boolean true
