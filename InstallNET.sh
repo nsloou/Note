@@ -359,6 +359,7 @@ if [[ -n "$tmpDIST" ]]; then
         [[ "$isDigital" == '10' ]] && DIST='buster';
         [[ "$isDigital" == '11' ]] && DIST='bullseye';
         [[ "$isDigital" == '12' ]] && DIST='bookworm';
+        [[ "$isDigital" == '13' ]] && DIST='trixie';
       }
     }
     LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
@@ -556,7 +557,7 @@ if [[ "$loaderMode" == "0" ]]; then
   lowMem || Add_OPTION="$Add_OPTION lowmem=+2"
 
   if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]]; then
-    BOOT_OPTION="auto=true $Add_OPTION hostname=$linux_relese domain=$linux_relese quiet"
+    BOOT_OPTION="auto=true $Add_OPTION hostname= 'debian' domain= 'debian' quiet"
   elif [[ "$linux_relese" == 'centos' ]]; then
     BOOT_OPTION="ks=file://ks.cfg $Add_OPTION ksdevice=$interfaceSelect"
   fi
