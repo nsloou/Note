@@ -637,8 +637,6 @@ d-i netcfg/get_gateway string $GATE
 d-i netcfg/get_nameservers string $ipDNS
 d-i netcfg/no_default_route boolean true
 d-i netcfg/confirm_static boolean true
-d-i netcfg/get_hostname string debian
-d-i netcfg/get_domain string debian
 
 d-i hw-detect/load_firmware boolean true
 
@@ -646,6 +644,8 @@ d-i mirror/country string manual
 d-i mirror/http/hostname string $MirrorHost
 d-i mirror/http/directory string $MirrorFolder
 d-i mirror/http/proxy string
+d-i netcfg/get_hostname string debian
+d-i netcfg/get_domain string debian
 
 d-i passwd/root-login boolean ture
 d-i passwd/make-user boolean false
