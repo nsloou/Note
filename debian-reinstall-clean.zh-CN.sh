@@ -49,34 +49,72 @@ boot_transaction=false
 boot_committed=false
 operation_lock_pid=
 operation_lock_fd=
+display_memory_mib=
 
 display_color_enabled() {
     [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]
 }
 
+display_style() {
+    # Display only: RGB on the requested modern SSH terminal; classic console
+    # types retain ANSI colors. No terminal queries or configuration changes.
+    local color=$1
+    if [ "$color" = 0 ]; then
+        printf '\033[1m'
+        return
+    fi
+    case "${TERM:-dumb}" in
+        linux|vt*|ansi) printf '\033[1;%sm' "$color"; return ;;
+    esac
+    case "$color" in
+        32) printf '\033[1;38;2;38;139;92m' ;;
+        33) printf '\033[1;38;2;181;125;24m' ;;
+        31) printf '\033[1;38;2;204;69;74m' ;;
+        *) printf '\033[1m' ;;
+    esac
+}
+
 display_heading() {
     local color=$1 text=$2
     if display_color_enabled; then
-        printf '\n  \033[1;%sm%s\033[0m\n' "$color" "$text" >&2
+        printf '\n' >&2
+        display_style "$color" >&2
+        printf '%s\033[0m\n' "$text" >&2
     else
-        printf '\n  %s\n' "$text" >&2
+        printf '\n%s\n' "$text" >&2
     fi
 }
 
 display_message() {
     local color=$1 label=$2 text=$3
-    # Use the terminal's own ANSI palette. No theme probes, fixed RGB colors,
-    # cursor control, animation or escape sequences in the message body.
     if display_color_enabled; then
-        printf '  \033[1;%sm%-5s\033[0m  %s\n' "$color" "$label" "$text" >&2
+        printf '  ' >&2
+        display_style "$color" >&2
+        printf '%-5s\033[0m  %s\n' "$label" "$text" >&2
     else
         printf '  %-5s  %s\n' "$label" "$text" >&2
     fi
 }
 
-log() { display_message 34 INFO "$*"; }
+log() { printf '  · %s\n' "$*" >&2; }
 warn() { display_message 33 WARN "$*"; }
 die() { display_message 31 ERROR "$*"; exit 1; }
+
+display_word() {
+    # Labels only. Internal authentication and memory-mode values stay intact.
+    case "$1" in
+        enabled)
+            printf '%s' "已启用"
+            ;;
+        disabled)
+            printf '%s' "未启用"
+            ;;
+        password)
+            printf '%s' "密码"
+            ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
 
 cleanup_apt_cache() {
     [ -n "${apt_cache_dir:-}" ] || return 0
@@ -2556,7 +2594,7 @@ configure_memory_mode() {
             if [ "$mem_mb" -le 256 ]; then low_memory_active=true; else low_memory_active=false; fi
             ;;
     esac
-    log "当前内存：${mem_mb} MiB；Debian Installer 自动判断低内存模式；存储驱动裁剪：$low_memory_active"
+    display_memory_mib=$mem_mb
 }
 
 add_low_memory_storage_modules() {
@@ -3005,47 +3043,55 @@ EOF
 }
 
 show_summary() {
-    display_heading 34 "Debian 重装计划"
+    local display_capacity display_storage=disabled
+    printf -v display_capacity '%d.%02d GiB' "$((disk_size / 1073741824))" \
+        "$(((disk_size % 1073741824) * 100 / 1073741824))"
+    if [ "$low_memory_active" = true ]; then display_storage=enabled; fi
+    display_heading 0 "Debian 重装计划"
     cat >&2 <<EOF
 
-  系统
-    目标系统         : Debian $release ($codename, $arch)
-    目标磁盘         : $target_disk
-    磁盘容量         : $disk_size 字节
-    分区表 UUID      : $disk_ptuuid
-    根文件系统       : $filesystem
-    启动方式         : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
+  ━━ 系统与磁盘 ━━
+    目标系统    : Debian $release ($codename, $arch)
+    目标磁盘    : $target_disk
+    磁盘容量    : ${display_capacity}（$disk_size 字节）
+    分区表 UUID : $disk_ptuuid
+    文件系统    : $filesystem
+    启动方式    : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
+    当前内存    : $display_memory_mib MiB
 
-  网络与登录
-    网络配置         : 当前默认 IPv4/IPv6 路由
-    SSH 端口         : $ssh_port
-    登录认证         : $credential_kind
+  ━━ 网络与登录 ━━
+    网络配置    : 当前默认 IPv4/IPv6 路由
+    SSH 端口    : $ssh_port
+    登录认证    : root / $(display_word "$credential_kind")
 
-  安装策略
-    镜像源           : $mirror
-    来源校验         : 必须通过 Debian 签名及 SHA-256 校验
-    安装器低内存模式 : Debian Installer 自动判断
-    临时 swap        : 低于 768 MiB 时使用，仅限安装期间
-    存储驱动裁剪     : $low_memory_active
-    执行方式         : 自动准备，手动重启
+  ━━ 安装策略 ━━
+    官方源      : $mirror
+    来源校验    : 必须通过 Debian 签名及 SHA-256 校验
+    低内存模式  : Debian Installer 自动判断
+    临时 swap   : 低于 768 MiB 时使用，仅限安装期间
+    驱动裁剪    : $(display_word "$display_storage")（仅限安装器）
+    执行方式    : 自动准备，手动重启
 
 EOF
 }
 
 show_completion() {
-    display_heading 32 "重装准备完成"
+    display_heading 32 "✓ 重装准备就绪"
     cat >&2 <<EOF
 
-  系统尚未重启。
-  下次启动将重新分区并格式化 ${target_disk}，清除该盘原有数据，
-  然后安装 Debian ${release}。
-  安装期间不开放 SSH 或 HTTP 管理服务。
+  尚未开始安装，系统不会自动重启。
 
-  重启前撤销：
-    bash -- $(printf '%q' "$0") --reset
+  下次启动将重新分区并格式化 ${target_disk}，
+  删除该盘原有数据，并安装 Debian ${release}。
 
-  准备好后启动：
+  重启后，当前 SSH 连接将断开。
+  安装期间不提供 SSH 或 HTTP 管理服务。
+
+  开始重装（立即重启）
     systemctl reboot
+
+  取消重装准备（仅限重启前）
+    bash -- $(printf '%q' "$0") --reset
 
 EOF
 }
