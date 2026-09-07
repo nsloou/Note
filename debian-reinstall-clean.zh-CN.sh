@@ -47,7 +47,16 @@ linked_grub_dir=false
 boot_transaction=false
 boot_committed=false
 
-log() { printf '\n==> %s\n' "$*" >&2; }
+display_heading() {
+    local color=$1 text=$2
+    if [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+        printf '\n\033[1;%sm%s\033[0m\n' "$color" "$text" >&2
+    else
+        printf '\n%s\n' "$text" >&2
+    fi
+}
+
+log() { display_heading 36 "==> $*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
@@ -656,7 +665,7 @@ load_signed_release() {
     local keyring=/usr/share/keyrings/debian-archive-keyring.gpg valid_until now expiry
     local signed_file="$workdir/InRelease"
     release_file="$workdir/Release.verified"
-    log "正在下载并验证 Debian $codename 的 InRelease 签名元数据"
+    log "正在下载并验证 Debian $codename 的 InRelease"
     secure_curl --output "$signed_file" "$mirror/dists/$codename/InRelease"
     [ -r "$keyring" ] || die "Debian archive keyring not found: $keyring"
     gpgv --keyring "$keyring" --output "$release_file" "$signed_file" >/dev/null 2>&1 ||
@@ -721,7 +730,7 @@ download_installer_images() {
         awk -v f="$item" '$2==f && length($1)==64 && $1 !~ /[^0-9a-f]/ {found++} END {exit found==1 ? 0 : 1}' "$sums" ||
             die "installer checksum list has no unambiguous entry for $item"
     done
-    log "正在下载 Debian Installer 内核及 initrd，随后校验哈希"
+    log "正在下载 Debian Installer 内核及 initrd"
     secure_curl --output "$workdir/linux" "$mirror/dists/$codename/${sums_rel%/*}/${kernel_rel#./}"
     secure_curl --output "$workdir/initrd.gz" "$mirror/dists/$codename/${sums_rel%/*}/${initrd_rel#./}"
     hash="$(awk -v f="$kernel_rel" '$2==f {print $1}' "$sums")"
@@ -2897,21 +2906,43 @@ EOF
 }
 
 show_summary() {
+    display_heading 36 "Debian 重装计划"
     cat >&2 <<EOF
+------------------------------------------------------------
+  目标系统         : Debian $release ($codename, $arch)
+  目标磁盘         : $target_disk
+  磁盘容量         : $disk_size 字节
+  分区表 UUID      : $disk_ptuuid
+  根文件系统       : $filesystem
+  启动方式         : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
 
-目标系统：Debian $release ($codename, $arch)
-目标磁盘：$target_disk
-磁盘分区表 UUID：$disk_ptuuid
-磁盘容量：$disk_size 字节
-网络配置：根据当前默认 IPv4/IPv6 路由自动采集
-官方软件源：$mirror（必须通过签名元数据及 SHA-256 校验）
-根文件系统：$filesystem
-登录认证：$credential_kind（密码）
-安装器低内存模式：由 Debian Installer 自动判断
-临时 swap：内存低于 768 MiB 时仅在安装期间使用，结束前删除
-安装器存储驱动裁剪：$low_memory_active（true 为启用，false 为不启用）
-启动方式：$([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
-执行方式：自动完成准备，仍需手动重启
+  网络配置         : 采集自当前默认 IPv4/IPv6 路由
+  镜像源           : $mirror
+  来源校验         : 必须通过签名元数据及 SHA-256 校验
+  登录认证         : $credential_kind
+
+  安装器低内存模式 : 由 Debian Installer 自动判断
+  临时 swap        : 内存低于 768 MiB 时仅在安装期间使用
+  存储驱动裁剪     : $low_memory_active
+  执行方式         : 自动完成准备，仍需手动重启
+------------------------------------------------------------
+EOF
+}
+
+show_completion() {
+    display_heading 32 "一次性 Debian 重装准备完成；脚本尚未重启系统"
+    cat >&2 <<EOF
+------------------------------------------------------------
+  下次启动将重新分区 $target_disk、格式化新文件系统，
+  并安装 Debian $release。
+  Debian Installer 运行期间不开放 SSH 或 HTTP 管理服务。
+
+  重启前撤销：
+    bash -- $(printf '%q' "$0") --reset
+
+  准备好后启动：
+    systemctl reboot
+------------------------------------------------------------
 EOF
 }
 
@@ -2920,7 +2951,7 @@ main() {
     validate_options
     preflight_source_system
     workdir="$(mktemp -d /var/tmp/debian-reinstall.XXXXXXXX)"
-    log "准备阶段临时工作目录：$workdir"
+    log "工作目录：$workdir"
     install_dependencies
     require_secure_boot_disabled
     detect_architecture
@@ -2947,13 +2978,7 @@ main() {
     repack_initrd
     install_one_shot_boot
 
-    log "一次性 Debian 重装准备完成；脚本尚未重启系统"
-    cat >&2 <<EOF
-下次启动将重新分区 $target_disk、格式化新文件系统并安装 Debian $release。
-Debian Installer 运行期间不开放 SSH 或 HTTP 管理服务。
-重启前撤销：bash $PROGRAM --reset
-开始重装：  systemctl reboot
-EOF
+    show_completion
 }
 
 if [ "${DEBIAN_REINSTALL_LIBRARY_ONLY:-0}" != 1 ]; then
