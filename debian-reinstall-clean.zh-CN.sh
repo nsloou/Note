@@ -67,6 +67,7 @@ display_style() {
         linux|vt*|ansi) printf '\033[1;%sm' "$color"; return ;;
     esac
     case "$color" in
+        36) printf '\033[1;38;2;55;148;176m' ;;
         32) printf '\033[1;38;2;38;139;92m' ;;
         33) printf '\033[1;38;2;181;125;24m' ;;
         31) printf '\033[1;38;2;204;69;74m' ;;
@@ -76,12 +77,25 @@ display_style() {
 
 display_heading() {
     local color=$1 text=$2
+    # Both language copies supply a pre-padded 54-column title. No runtime
+    # Unicode-width calculation, locale dependency or terminal-size query.
     if display_color_enabled; then
         printf '\n' >&2
         display_style "$color" >&2
+        printf '╭──────────────────────────────────────────────────────╮\n│%s│\n╰──────────────────────────────────────────────────────╯\033[0m\n' "$text" >&2
+    else
+        printf '\n╭──────────────────────────────────────────────────────╮\n│%s│\n╰──────────────────────────────────────────────────────╯\n' "$text" >&2
+    fi
+}
+
+display_section() {
+    local text=$1
+    printf '\n' >&2
+    if display_color_enabled; then
+        display_style 36 >&2
         printf '%s\033[0m\n' "$text" >&2
     else
-        printf '\n%s\n' "$text" >&2
+        printf '%s\n' "$text" >&2
     fi
 }
 
@@ -96,7 +110,14 @@ display_message() {
     fi
 }
 
-log() { printf '  · %s\n' "$*" >&2; }
+log() {
+    if display_color_enabled; then
+        display_style 36 >&2
+        printf '  ·\033[0m %s\n' "$*" >&2
+    else
+        printf '  · %s\n' "$*" >&2
+    fi
+}
 warn() { display_message 33 WARN "$*"; }
 die() { display_message 31 ERROR "$*"; exit 1; }
 
@@ -3047,10 +3068,9 @@ show_summary() {
     printf -v display_capacity '%d.%02d GiB' "$((disk_size / 1073741824))" \
         "$(((disk_size % 1073741824) * 100 / 1073741824))"
     if [ "$low_memory_active" = true ]; then display_storage=enabled; fi
-    display_heading 0 "Debian 重装计划"
+    display_heading 36 "  Debian 重装计划                                     "
+    display_section "━━ 系统与磁盘 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     cat >&2 <<EOF
-
-  ━━ 系统与磁盘 ━━
     目标系统    : Debian $release ($codename, $arch)
     目标磁盘    : $target_disk
     磁盘容量    : ${display_capacity}（$disk_size 字节）
@@ -3058,25 +3078,27 @@ show_summary() {
     文件系统    : $filesystem
     启动方式    : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
     当前内存    : $display_memory_mib MiB
-
-  ━━ 网络与登录 ━━
+EOF
+    display_section "━━ 网络与登录 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    cat >&2 <<EOF
     网络配置    : 当前默认 IPv4/IPv6 路由
     SSH 端口    : $ssh_port
     登录认证    : root / $(display_word "$credential_kind")
-
-  ━━ 安装策略 ━━
+EOF
+    display_section "━━ 安装策略 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    cat >&2 <<EOF
     官方源      : $mirror
     来源校验    : 必须通过 Debian 签名及 SHA-256 校验
     低内存模式  : Debian Installer 自动判断
     临时 swap   : 低于 768 MiB 时使用，仅限安装期间
     驱动裁剪    : $(display_word "$display_storage")（仅限安装器）
     执行方式    : 自动准备，手动重启
-
 EOF
+    display_section "━━ 准备进度 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
 show_completion() {
-    display_heading 32 "✓ 重装准备就绪"
+    display_heading 32 "  ✓ 重装准备就绪                                      "
     cat >&2 <<EOF
 
   尚未开始安装，系统不会自动重启。
