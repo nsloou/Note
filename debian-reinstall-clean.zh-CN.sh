@@ -18,6 +18,7 @@ readonly GRUB_DEFAULT_DROPIN=/etc/default/grub.d/99-debian-reinstall-once.cfg
 readonly KEXEC_DEFAULT=/etc/default/kexec
 readonly KEXEC_BACKUP_NAME=source-kexec.default
 readonly MIN_DISK_BYTES=4294967296
+readonly OPERATION_LOCK=/run/debian-reinstall.lock
 
 release=13
 release_set=false
@@ -46,19 +47,36 @@ source_codename=
 linked_grub_dir=false
 boot_transaction=false
 boot_committed=false
+operation_lock_pid=
+operation_lock_fd=
+
+display_color_enabled() {
+    [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]
+}
 
 display_heading() {
     local color=$1 text=$2
-    if [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
-        printf '\n\033[1;%sm%s\033[0m\n' "$color" "$text" >&2
+    if display_color_enabled; then
+        printf '\n  \033[1;%sm%s\033[0m\n' "$color" "$text" >&2
     else
-        printf '\n%s\n' "$text" >&2
+        printf '\n  %s\n' "$text" >&2
     fi
 }
 
-log() { display_heading 36 "==> $*"; }
-warn() { printf 'WARNING: %s\n' "$*" >&2; }
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+display_message() {
+    local color=$1 label=$2 text=$3
+    # Use the terminal's own ANSI palette. No theme probes, fixed RGB colors,
+    # cursor control, animation or escape sequences in the message body.
+    if display_color_enabled; then
+        printf '  \033[1;%sm%-5s\033[0m  %s\n' "$color" "$label" "$text" >&2
+    else
+        printf '  %-5s  %s\n' "$label" "$text" >&2
+    fi
+}
+
+log() { display_message 34 INFO "$*"; }
+warn() { display_message 33 WARN "$*"; }
+die() { display_message 31 ERROR "$*"; exit 1; }
 
 cleanup_apt_cache() {
     [ -n "${apt_cache_dir:-}" ] || return 0
@@ -74,7 +92,7 @@ cleanup() {
     if $boot_transaction && ! $boot_committed; then
         if ! rollback_prepared_boot; then
             keep_workdir=true
-            warn "自动撤销引导准备失败。请勿重启；备份保留在 $workdir。请运行 --reset 并检查 GRUB。"
+            warn "自动撤销引导准备失败。请勿重启；备份保留在 ${workdir}。请运行 --reset 并检查 GRUB。"
         fi
     fi
     if ! cleanup_apt_cache; then
@@ -213,6 +231,27 @@ find_grub_command() {
     return 1
 }
 
+acquire_operation_lock() {
+    # Keep the same inode for all invocations; removing the lock file at EXIT
+    # would allow another process to lock a different inode at the same path.
+    # BASHPID deliberately distinguishes an inherited subshell from its parent.
+    [ "$operation_lock_pid" != "$BASHPID" ] || return 0
+    command -v flock >/dev/null 2>&1 || die "util-linux flock is required for safe preparation and reset"
+    [ ! -L "$OPERATION_LOCK" ] || die "the operation lock must not be a symbolic link"
+    [ ! -e "$OPERATION_LOCK" ] || [ -f "$OPERATION_LOCK" ] || die "the operation lock is not a regular file"
+    exec {operation_lock_fd}>>"$OPERATION_LOCK" || die "could not open the operation lock"
+    flock -n "$operation_lock_fd" || die "another preparation or reset is running; wait for it to finish"
+    operation_lock_pid=$BASHPID
+}
+
+assert_no_prepared_state() {
+    local path
+    for path in "$STATE_DIR" "$GRUB_SCRIPT" "$GRUB_DEFAULT_DROPIN"; do
+        [ ! -e "$path" ] && [ ! -L "$path" ] ||
+            die "an earlier preparation exists at $path; run --reset before preparing again"
+    done
+}
+
 disarm_our_boot() {
     local grub_editenv current
     grub_editenv="$(find_grub_command grub-editenv grub2-editenv)" || return 1
@@ -225,6 +264,7 @@ disarm_our_boot() {
 }
 
 rollback_prepared_boot() {
+    [ "$operation_lock_pid" = "$BASHPID" ] || return 1
     # Never delete boot assets while the destructive entry may remain armed.
     disarm_our_boot || return 1
     if [ -f "$workdir/grub.cfg.before" ]; then
@@ -239,19 +279,31 @@ rollback_prepared_boot() {
 
 reset_prepared_boot() {
     require_root_debian
-    local update_grub
-    update_grub="$(find_grub_command update-grub || true)"
+    acquire_operation_lock
+    local update_grub grub_editenv current active_cfg
+    update_grub="$(find_grub_command update-grub)" ||
+        die "update-grub is required to complete reset; files retained, do not reboot"
+    grub_editenv="$(find_grub_command grub-editenv grub2-editenv)" ||
+        die "grub-editenv is required to complete reset; files retained, do not reboot"
     disarm_our_boot || die "could not verify the reinstall entry is disarmed; files retained, do not reboot"
 
     if [ -f "$STATE_DIR/$KEXEC_BACKUP_NAME" ]; then
-        cp -p -- "$STATE_DIR/$KEXEC_BACKUP_NAME" "$KEXEC_DEFAULT"
+        cp -p -- "$STATE_DIR/$KEXEC_BACKUP_NAME" "$KEXEC_DEFAULT" || die "could not restore the source kexec configuration"
         log "已恢复旧系统的 kexec 配置"
     fi
-    rm -f -- "$GRUB_SCRIPT" "$GRUB_DEFAULT_DROPIN"
-    rm -rf -- "$STATE_DIR"
-    if [ -n "$update_grub" ]; then
-        "$update_grub"
+    rm -f -- "$GRUB_SCRIPT" "$GRUB_DEFAULT_DROPIN" || die "could not remove the reinstall GRUB scripts"
+    rm -rf -- "$STATE_DIR" || die "could not remove the reinstall boot assets"
+    "$update_grub" || die "reset is incomplete: update-grub failed; do not reboot"
+    active_cfg="$(cat /boot/grub/grub.cfg)" || die "reset is incomplete: cannot read the regenerated GRUB configuration"
+    [ -n "$active_cfg" ] || die "reset is incomplete: the regenerated GRUB configuration is empty"
+    if grep -Fq -- '--id debian-reinstall' <<<"$active_cfg"; then
+        die "reset is incomplete: the regenerated GRUB configuration still contains the reinstall entry"
     fi
+    current="$("$grub_editenv" - list)" || die "reset is incomplete: cannot verify the final GRUB environment"
+    if grep -Fxq next_entry=debian-reinstall <<<"$current"; then
+        die "reset is incomplete: the reinstall entry is still armed; do not reboot"
+    fi
+    assert_no_prepared_state
     log "已移除准备好的重装启动项及文件"
 }
 
@@ -267,9 +319,12 @@ validate_options() {
         13) codename=trixie ;;
         *) die "the target release must be 13" ;;
     esac
-    if ! [[ "$ssh_port" =~ ^[0-9]+$ ]] || [ "$ssh_port" -lt 1 ] || [ "$ssh_port" -gt 65535 ]; then
-        die "invalid SSH port"
-    fi
+    [[ "$ssh_port" =~ ^[0-9]+$ ]] || die "invalid SSH port: use 1-65535"
+    # Normalize without arithmetic: even an oversized input must not overflow
+    # Bash's integer comparison or survive into the destructive installer.
+    ssh_port=${ssh_port#"${ssh_port%%[!0]*}"}
+    [ -n "$ssh_port" ] && [ "${#ssh_port}" -le 5 ] || die "invalid SSH port: use 1-65535"
+    [ "$ssh_port" -le 65535 ] || die "invalid SSH port: use 1-65535"
     [ -n "$password_value" ] || die "--password is required"
     [[ "$password_value" != *$'\n'* ]] || die "password must not contain a newline"
     [ "${#password_value}" -ge 16 ] || die "password must contain at least 16 characters"
@@ -578,43 +633,85 @@ route_token() {
     awk -v key="$key" '{for (i=1;i<NF;i++) if ($i==key) {print $(i+1); exit}}' <<<"$*"
 }
 
+write_network_fact() {
+    local path=$1 value=$2 saved
+    printf '%s\n' "$value" >"$path" || die "could not write captured network setting: $path"
+    saved="$(cat -- "$path")" || die "could not read back captured network setting: $path"
+    [ "$saved" = "$value" ] || die "captured network setting failed read-back verification: $path"
+}
+
+verify_captured_network() {
+    local cfg key family found=false configured mac
+    for cfg in "$initrd_dir"/configs/net/*; do
+        [ -d "$cfg" ] || continue
+        found=true
+        for key in mac source_interface; do
+            [ -f "$cfg/$key" ] && [ ! -L "$cfg/$key" ] && [ -s "$cfg/$key" ] ||
+                die "missing or unsafe captured network setting: $cfg/$key"
+        done
+        mac="$(cat "$cfg/mac")" || die "could not read captured network MAC"
+        [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ && ${cfg##*/} = "${mac//:/}" ]] ||
+            die "captured network MAC does not match its configuration directory"
+        configured=false
+        for family in 4 6; do
+            if [ -e "$cfg/ipv${family}_addr" ] || [ -L "$cfg/ipv${family}_addr" ] ||
+                [ -e "$cfg/ipv${family}_gateway" ] || [ -L "$cfg/ipv${family}_gateway" ]; then
+                for key in "ipv${family}_addr" "ipv${family}_gateway"; do
+                    [ -f "$cfg/$key" ] && [ ! -L "$cfg/$key" ] && [ -s "$cfg/$key" ] ||
+                        die "incomplete or unsafe captured network setting: $cfg/$key"
+                done
+                configured=true
+            fi
+        done
+        $configured || die "captured network interface has no complete address and gateway: $cfg"
+    done
+    $found || die "no captured network configuration is available"
+}
+
 collect_one_network() {
-    local family=$1 probe=$2 line dev src gateway addr mac all_addrs extras cfg id candidate
+    local family=$1 probe=$2 line dev src gateway addr mac all_addrs extras cfg id candidate routes
     dev=; gateway=
+    # A kernel with IPv6 disabled has no IPv6 table to query. Other query/write
+    # failures are fatal, not equivalent to an absent default route.
+    if [ "$family" = 6 ] && [ ! -r /proc/net/if_inet6 ]; then return 1; fi
+    routes="$(ip -"$family" route show table main default)" || die "could not read default IPv$family routes"
     # Select the underlying default NIC, not a probe-specific WARP/TUN route.
     # Each multipath nexthop continuation is considered separately.
     while IFS= read -r line; do
-        candidate="$(route_token dev "$line")"
+        candidate="$(route_token dev "$line")" || die "could not parse the default route interface"
         [ -n "$candidate" ] && [ -e "/sys/class/net/$candidate/device" ] || continue
-        gateway="$(route_token via "$line")"
+        gateway="$(route_token via "$line")" || die "could not parse the default route gateway"
         [ -n "$gateway" ] || continue
         dev=$candidate
         break
-    done < <(ip -"$family" route show table main default)
+    done <<<"$routes"
     [ -n "$dev" ] || return 1
     line="$(ip -"$family" route get "$probe" oif "$dev" 2>/dev/null | head -n 1 || true)"
-    src="$(route_token src "$line")"
-    all_addrs="$(ip -"$family" -o addr show scope global dev "$dev" | awk '$0 !~ / temporary / {print $4}')"
+    src="$(route_token src "$line")" || die "could not parse the source address"
+    all_addrs="$(ip -"$family" -o addr show scope global dev "$dev" | awk '$0 !~ / temporary / {print $4}')" ||
+        die "could not read IPv$family addresses for $dev"
     [ -n "$all_addrs" ] || return 1
-    addr="$(printf '%s\n' "$all_addrs" | awk -F/ -v src="$src" '$1==src {print; exit}')"
-    [ -n "$addr" ] || addr="$(printf '%s\n' "$all_addrs" | head -n 1)"
-    mac="$(tr '[:upper:]' '[:lower:]' <"/sys/class/net/$dev/address")"
+    addr="$(printf '%s\n' "$all_addrs" | awk -F/ -v src="$src" '$1==src {print; exit}')" ||
+        die "could not select the source address"
+    [ -n "$addr" ] || addr=${all_addrs%%$'\n'*}
+    mac="$(tr '[:upper:]' '[:lower:]' <"/sys/class/net/$dev/address")" || die "could not read MAC address for $dev"
     [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || die "invalid MAC address for $dev"
     id=${mac//:/}
     cfg="$initrd_dir/configs/net/$id"
-    mkdir -p "$cfg"
-    printf '%s\n' "$mac" >"$cfg/mac"
-    printf '%s\n' "$dev" >"$cfg/source_interface"
+    mkdir -p "$cfg" || die "could not create captured network configuration: $cfg"
+    write_network_fact "$cfg/mac" "$mac"
+    write_network_fact "$cfg/source_interface" "$dev"
     if [ "$family" = 4 ]; then
-        printf '%s\n' "$addr" >"$cfg/ipv4_addr"
-        printf '%s\n' "$gateway" >"$cfg/ipv4_gateway"
+        write_network_fact "$cfg/ipv4_addr" "$addr"
+        write_network_fact "$cfg/ipv4_gateway" "$gateway"
     else
-        printf '%s\n' "$addr" >"$cfg/ipv6_addr"
-        printf '%s\n' "$gateway" >"$cfg/ipv6_gateway"
-        extras="$(printf '%s\n' "$all_addrs" | grep -Fxv "$addr" | paste -sd, - || true)"
-        printf '%s\n' "$extras" >"$cfg/ipv6_extra_addrs"
+        write_network_fact "$cfg/ipv6_addr" "$addr"
+        write_network_fact "$cfg/ipv6_gateway" "$gateway"
+        extras="$(printf '%s\n' "$all_addrs" | awk -v primary="$addr" '$0!=primary {printf "%s%s", sep, $0; sep=","}')" ||
+            die "could not collect additional IPv6 addresses"
+        write_network_fact "$cfg/ipv6_extra_addrs" "$extras"
     fi
-    log "已采集 IPv$family：网卡 $dev，地址 $addr，网关 $gateway，MAC $mac"
+    log "已采集 IPv${family}：网卡 ${dev}，地址 ${addr}，网关 ${gateway}，MAC ${mac}"
 }
 
 collect_network() {
@@ -622,6 +719,7 @@ collect_network() {
     if collect_one_network 4 1.1.1.1; then found=true; fi
     if collect_one_network 6 2606:4700:4700::1111; then found=true; fi
     $found || die "could not capture a usable default IPv4 or IPv6 route"
+    verify_captured_network
 }
 
 secure_curl() {
@@ -2705,6 +2803,7 @@ EOF
 
 verify_initrd_contents() {
     local required timeout_rc=0
+    verify_captured_network
     for required in \
         preseed.cfg initrd-network.sh debian-network-render.sh debian-netcfg.sh \
         get-target-disk.sh can-use-cloud-kernel.sh installer-early.sh \
@@ -2805,6 +2904,7 @@ install_one_shot_boot() {
     local update_grub grub_reboot grub_editenv grub_kernel grub_initrd
     local boot_kib boot_available required_bytes active_cfg grub_script_check next_entry installer_console
     local boot_uuid uuid_devices
+    acquire_operation_lock
     update_grub="$(find_grub_command update-grub || true)"
     grub_reboot="$(find_grub_command grub-reboot grub2-reboot || true)"
     grub_editenv="$(find_grub_command grub-editenv grub2-editenv || true)"
@@ -2820,8 +2920,7 @@ install_one_shot_boot() {
     [ "$boot_available" -ge "$required_bytes" ] ||
         die "not enough free space on /boot for the verified installer artifacts and safety margin"
 
-    [ ! -e "$STATE_DIR" ] && [ ! -e "$GRUB_SCRIPT" ] && [ ! -e "$GRUB_DEFAULT_DROPIN" ] ||
-        die "an earlier preparation exists; run --reset before preparing again"
+    assert_no_prepared_state
     next_entry="$("$grub_editenv" - list | sed -n 's/^next_entry=//p')"
     [ -z "$next_entry" ] || die "another one-shot boot is already selected: $next_entry"
     cp -p -- /boot/grub/grub.cfg "$workdir/grub.cfg.before"
@@ -2906,49 +3005,56 @@ EOF
 }
 
 show_summary() {
-    display_heading 36 "Debian 重装计划"
+    display_heading 34 "Debian 重装计划"
     cat >&2 <<EOF
-------------------------------------------------------------
-  目标系统         : Debian $release ($codename, $arch)
-  目标磁盘         : $target_disk
-  磁盘容量         : $disk_size 字节
-  分区表 UUID      : $disk_ptuuid
-  根文件系统       : $filesystem
-  启动方式         : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
 
-  网络配置         : 采集自当前默认 IPv4/IPv6 路由
-  镜像源           : $mirror
-  来源校验         : 必须通过签名元数据及 SHA-256 校验
-  登录认证         : $credential_kind
+  系统
+    目标系统         : Debian $release ($codename, $arch)
+    目标磁盘         : $target_disk
+    磁盘容量         : $disk_size 字节
+    分区表 UUID      : $disk_ptuuid
+    根文件系统       : $filesystem
+    启动方式         : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
 
-  安装器低内存模式 : 由 Debian Installer 自动判断
-  临时 swap        : 内存低于 768 MiB 时仅在安装期间使用
-  存储驱动裁剪     : $low_memory_active
-  执行方式         : 自动完成准备，仍需手动重启
-------------------------------------------------------------
+  网络与登录
+    网络配置         : 当前默认 IPv4/IPv6 路由
+    SSH 端口         : $ssh_port
+    登录认证         : $credential_kind
+
+  安装策略
+    镜像源           : $mirror
+    来源校验         : 必须通过 Debian 签名及 SHA-256 校验
+    安装器低内存模式 : Debian Installer 自动判断
+    临时 swap        : 低于 768 MiB 时使用，仅限安装期间
+    存储驱动裁剪     : $low_memory_active
+    执行方式         : 自动准备，手动重启
+
 EOF
 }
 
 show_completion() {
-    display_heading 32 "一次性 Debian 重装准备完成；脚本尚未重启系统"
+    display_heading 32 "重装准备完成"
     cat >&2 <<EOF
-------------------------------------------------------------
-  下次启动将重新分区 $target_disk、格式化新文件系统，
-  并安装 Debian $release。
-  Debian Installer 运行期间不开放 SSH 或 HTTP 管理服务。
+
+  系统尚未重启。
+  下次启动将重新分区并格式化 ${target_disk}，清除该盘原有数据，
+  然后安装 Debian ${release}。
+  安装期间不开放 SSH 或 HTTP 管理服务。
 
   重启前撤销：
     bash -- $(printf '%q' "$0") --reset
 
   准备好后启动：
     systemctl reboot
-------------------------------------------------------------
+
 EOF
 }
 
 main() {
     require_root_debian
     validate_options
+    acquire_operation_lock
+    assert_no_prepared_state
     preflight_source_system
     workdir="$(mktemp -d /var/tmp/debian-reinstall.XXXXXXXX)"
     log "工作目录：$workdir"
