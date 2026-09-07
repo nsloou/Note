@@ -15,6 +15,9 @@ readonly PROGRAM=${0##*/}
 readonly STATE_DIR=/boot/debian-reinstall
 readonly GRUB_SCRIPT=/etc/grub.d/42_debian_reinstall
 readonly GRUB_DEFAULT_DROPIN=/etc/default/grub.d/99-debian-reinstall-once.cfg
+readonly KEXEC_DEFAULT=/etc/default/kexec
+readonly KEXEC_BACKUP_NAME=source-kexec.default
+readonly MIN_DISK_BYTES=4294967296
 
 release=13
 release_set=false
@@ -30,6 +33,7 @@ low_memory=auto
 keep_workdir=false
 action=prepare
 workdir=
+apt_cache_dir=
 initrd_dir=
 release_file=
 package_index_deb=
@@ -39,24 +43,56 @@ kernel_image=
 mirror_host=
 mirror_directory=
 source_codename=
+linked_grub_dir=false
+boot_transaction=false
+boot_committed=false
 
-log() { printf '\n==> %s\n' "$*" >&2; }
+display_heading() {
+    local color=$1 text=$2
+    if [[ -t 2 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+        printf '\n\033[1;%sm%s\033[0m\n' "$color" "$text" >&2
+    else
+        printf '\n%s\n' "$text" >&2
+    fi
+}
+
+log() { display_heading 36 "==> $*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+cleanup_apt_cache() {
+    [ -n "${apt_cache_dir:-}" ] || return 0
+    if ! rm -rf -- "$apt_cache_dir"; then
+        warn "Could not remove preparation APT cache: $apt_cache_dir"
+        return 1
+    fi
+    apt_cache_dir=
+}
+
 cleanup() {
     status=$?
+    if $boot_transaction && ! $boot_committed; then
+        if ! rollback_prepared_boot; then
+            keep_workdir=true
+            warn "Automatic boot rollback failed. Do not reboot; backup retained at $workdir. Run --reset and inspect GRUB."
+        fi
+    fi
+    if ! cleanup_apt_cache; then
+        [ "$status" -ne 0 ] || status=1
+    fi
     if [ -n "${workdir:-}" ] && [ -d "$workdir" ] && ! $keep_workdir; then
         rm -rf -- "$workdir"
     fi
     exit "$status"
 }
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 usage() {
     cat <<EOF
 Usage:
-  $PROGRAM debian 12|13 --password PASSWORD [--ssh-port PORT]
+  $PROGRAM debian 13 --password PASSWORD [--ssh-port PORT]
   $PROGRAM --reset
 
 Prepare a one-shot boot into Debian Installer. The script never reboots by
@@ -64,7 +100,7 @@ itself. Rebooting starts an unattended install that deletes the old partition
 layout, creates new filesystems, and erases the selected disk logically.
 
 Options:
-  debian 12|13                Required target and release
+  debian 13                   Required target and release (source: Debian 12/13)
   --password PASSWORD         Password for the root account
   --ssh-port PORT             Installed system SSH port (default: 22)
   --reset                     Remove the prepared one-shot boot entry/files
@@ -92,7 +128,7 @@ while [ $# -gt 0 ]; do
             distro_seen=true
             shift
             ;;
-        12|13)
+        13)
             $release_set && die "specify the Debian release only once"
             release=$1
             release_set=true
@@ -111,10 +147,11 @@ done
 require_root_debian() {
     [ "$(id -u)" -eq 0 ] || die "run as root"
     [ -r /etc/os-release ] || die "cannot identify the source operating system"
-    # shellcheck disable=SC1091
-    . /etc/os-release
-    [ "${ID:-}" = debian ] || die "this reduced script supports Debian as the source OS only"
-    case "${VERSION_ID%%.*}" in
+    local source_id source_version
+    source_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '\"')"
+    source_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '\"')"
+    [ "$source_id" = debian ] || die "this reduced script supports Debian as the source OS only"
+    case "$source_version" in
         12) source_codename=bookworm ;;
         13) source_codename=trixie ;;
         *) die "the source OS must be Debian 12 or Debian 13" ;;
@@ -122,6 +159,49 @@ require_root_debian() {
     if command -v systemd-detect-virt >/dev/null 2>&1 &&
         systemd-detect-virt --container --quiet; then
         die "containers (LXC/OpenVZ/Docker) cannot replace their kernel or boot disk; use a KVM/VM instance"
+    fi
+}
+
+secure_boot_enabled() {
+    local variable value
+    [ -d /sys/firmware/efi ] || return 1
+    variable="$(find /sys/firmware/efi/efivars -maxdepth 1 \
+        -name 'SecureBoot-*' -print -quit 2>/dev/null || true)"
+    if [ -n "$variable" ]; then
+        value="$(od -An -t u1 -j 4 -N 1 "$variable" 2>/dev/null | tr -d '[:space:]' || true)"
+        [ "$value" = 1 ] && return 0
+    fi
+    if command -v mokutil >/dev/null 2>&1 &&
+        mokutil --sb-state 2>&1 | grep -Fqi 'SecureBoot enabled'; then
+        return 0
+    fi
+    dmesg 2>/dev/null | grep -Fqi 'Secure boot enabled'
+}
+
+preflight_source_system() {
+    local root_fstype root_source stack
+    root_fstype="$(findmnt -n -o FSTYPE / 2>/dev/null || true)"
+    case "$root_fstype" in
+        overlay|squashfs|tmpfs|ramfs|rootfs)
+            die "live/overlay root filesystem $root_fstype is not a supported reinstall source"
+            ;;
+        '') die "could not determine the source root filesystem type" ;;
+    esac
+
+    root_source="$(findmnt -n -o SOURCE -e / 2>/dev/null || findmnt -n -o SOURCE /)"
+    root_source=${root_source%%\[*}
+    if [ -b "$root_source" ]; then
+        stack="$(lsblk -s -n -o TYPE "$root_source" 2>/dev/null || true)"
+        if grep -Eq '^(crypt|raid[0-9]+|md)$' <<<"$stack"; then
+            die "encrypted or software-RAID source roots are not supported unattended; use the provider console/rescue environment"
+        fi
+    fi
+
+}
+
+require_secure_boot_disabled() {
+    if secure_boot_enabled; then
+        die "UEFI Secure Boot is enabled; disable it before using this unverified custom-initrd boot path"
     fi
 }
 
@@ -133,17 +213,42 @@ find_grub_command() {
     return 1
 }
 
+disarm_our_boot() {
+    local grub_editenv current
+    grub_editenv="$(find_grub_command grub-editenv grub2-editenv)" || return 1
+    current="$("$grub_editenv" - list)" || return 1
+    if grep -Fxq next_entry=debian-reinstall <<<"$current"; then
+        "$grub_editenv" - unset next_entry || return 1
+        current="$("$grub_editenv" - list)" || return 1
+        ! grep -Fxq next_entry=debian-reinstall <<<"$current" || return 1
+    fi
+}
+
+rollback_prepared_boot() {
+    # Never delete boot assets while the destructive entry may remain armed.
+    disarm_our_boot || return 1
+    if [ -f "$workdir/grub.cfg.before" ]; then
+        cp -p -- "$workdir/grub.cfg.before" /boot/grub/grub.cfg || return 1
+    fi
+    if [ -f "$STATE_DIR/$KEXEC_BACKUP_NAME" ]; then
+        cp -p -- "$STATE_DIR/$KEXEC_BACKUP_NAME" "$KEXEC_DEFAULT" || return 1
+    fi
+    rm -f -- "$GRUB_SCRIPT" "$GRUB_DEFAULT_DROPIN" || return 1
+    rm -rf -- "$STATE_DIR"
+}
+
 reset_prepared_boot() {
     require_root_debian
-    local update_grub grub_editenv
+    local update_grub
     update_grub="$(find_grub_command update-grub || true)"
-    grub_editenv="$(find_grub_command grub-editenv || true)"
+    disarm_our_boot || die "could not verify the reinstall entry is disarmed; files retained, do not reboot"
 
+    if [ -f "$STATE_DIR/$KEXEC_BACKUP_NAME" ]; then
+        cp -p -- "$STATE_DIR/$KEXEC_BACKUP_NAME" "$KEXEC_DEFAULT"
+        log "Restored the source system kexec configuration"
+    fi
     rm -f -- "$GRUB_SCRIPT" "$GRUB_DEFAULT_DROPIN"
     rm -rf -- "$STATE_DIR"
-    if [ -n "$grub_editenv" ]; then
-        "$grub_editenv" - unset next_entry 2>/dev/null || true
-    fi
     if [ -n "$update_grub" ]; then
         "$update_grub"
     fi
@@ -156,12 +261,11 @@ if [ "$action" = reset ]; then
 fi
 
 validate_options() {
-    $distro_seen || die "target must be specified as: debian 12 or debian 13"
-    $release_set || die "target must be specified as: debian 12 or debian 13"
+    $distro_seen || die "target must be specified as: debian 13"
+    $release_set || die "target must be specified as: debian 13"
     case "$release" in
-        12) codename=bookworm ;;
         13) codename=trixie ;;
-        *) die "release must be 12 or 13" ;;
+        *) die "the target release must be 13" ;;
     esac
     if ! [[ "$ssh_port" =~ ^[0-9]+$ ]] || [ "$ssh_port" -lt 1 ] || [ "$ssh_port" -gt 65535 ]; then
         die "invalid SSH port"
@@ -181,11 +285,68 @@ validate_options() {
     fi
 }
 
+prepare_apt_cache() {
+    local apt_uid
+    [ -z "$apt_cache_dir" ] || die "preparation APT cache is already allocated"
+    apt_uid="$(id -u _apt 2>/dev/null)" || die "Debian APT sandbox account _apt is missing"
+    [[ "$apt_uid" =~ ^[0-9]+$ ]] && [ "$apt_uid" -ne 0 ] ||
+        die "Debian APT sandbox account _apt must have a non-root UID"
+
+    # Only public repository indexes/packages go here. Do not relax workdir:
+    # it also holds credentials and the prepared installer. APT's downloader
+    # needs searchable ancestors and its own private, writable partial dirs.
+    apt_cache_dir="$(mktemp -d /var/tmp/debian-reinstall-apt.XXXXXXXX)"
+    chmod 0711 "$apt_cache_dir"
+    install -d -o 0 -g 0 -m 0755 "$apt_cache_dir/lists" "$apt_cache_dir/archives"
+    install -d -o "$apt_uid" -g 0 -m 0700 \
+        "$apt_cache_dir/lists/partial" "$apt_cache_dir/archives/partial"
+}
+
 install_dependencies() {
-    local packages=(ca-certificates curl gpgv debian-archive-keyring xz-utils cpio binutils fdisk util-linux iproute2 grub-common grub2-common kmod whois)
+    local packages=(ca-certificates curl gpgv debian-archive-keyring xz-utils cpio binutils fdisk util-linux iproute2 grub-common grub2-common kmod whois mokutil)
     local apt_sources
     local -a apt_options
-    apt_sources="$(mktemp /var/tmp/debian-reinstall-apt.XXXXXXXX.list)"
+    local apt_root="$workdir/apt"
+    mkdir -p "$apt_root"/{empty,home}
+    prepare_apt_cache
+    : >"$apt_root/empty.conf"
+    apt_sources="$apt_root/sources.list"
+    # APT_CONFIG is loaded BEFORE system apt.conf.d; command-line overrides
+    # alone cannot prevent vendor hooks from loading.
+    cat >"$apt_root/apt.conf" <<EOF
+Dir::Etc::main "$apt_root/empty.conf";
+Dir::Etc::parts "$apt_root/empty";
+Dir::Etc::sourcelist "$apt_sources";
+Dir::Etc::sourceparts "$apt_root/empty";
+Dir::Etc::preferences "$apt_root/empty.conf";
+Dir::Etc::preferencesparts "$apt_root/empty";
+Dir::State::lists "$apt_cache_dir/lists";
+Dir::Cache::archives "$apt_cache_dir/archives";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+APT::Sandbox::User "_apt";
+Acquire::https::Verify-Peer "true";
+Acquire::https::Verify-Host "true";
+EOF
+    # dpkg also has independent configuration hooks. Hide its option files
+    # only inside a private mount namespace; leave the source OS files intact.
+    command -v unshare >/dev/null || die "util-linux unshare is required for isolated preparation"
+    unshare --mount --propagation private true ||
+        die "private mount namespaces are unavailable; use a trusted rescue environment"
+    clean_apt() {
+        env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME="$apt_root/home" \
+            APT_CONFIG="$apt_root/apt.conf" DEBIAN_FRONTEND=noninteractive \
+            unshare --mount --propagation private sh -eu -c '
+                isolation=$1; shift
+                if [ -f /etc/dpkg/dpkg.cfg ]; then
+                    mount --bind "$isolation/empty.conf" /etc/dpkg/dpkg.cfg
+                fi
+                if [ -d /etc/dpkg/dpkg.cfg.d ]; then
+                    mount --bind "$isolation/empty" /etc/dpkg/dpkg.cfg.d
+                fi
+                exec apt-get "$@"
+            ' sh "$apt_root" "$@"
+    }
     apt_options=(
         -o "Dir::Etc::sourcelist=$apt_sources"
         -o Dir::Etc::sourceparts=-
@@ -209,28 +370,28 @@ install_dependencies() {
     }
 
     log "Installing preparation tools from official Debian $source_codename repositories only"
-    export DEBIAN_FRONTEND=noninteractive
     write_dependency_sources https
-    if ! apt-get "${apt_options[@]}" update; then
+    if ! clean_apt "${apt_options[@]}" update; then
         warn "official HTTPS APT failed; bootstrapping CA/keyring through authenticated Debian HTTP"
         write_dependency_sources http
-        if ! apt-get "${apt_options[@]}" update ||
-            ! apt-get "${apt_options[@]}" install -y --reinstall --no-install-recommends \
+        if ! clean_apt "${apt_options[@]}" update ||
+            ! clean_apt "${apt_options[@]}" install -y --reinstall --no-install-recommends \
                 ca-certificates debian-archive-keyring gpgv; then
             rm -f -- "$apt_sources"
             die "could not bootstrap trusted HTTPS from authenticated Debian repositories"
         fi
         write_dependency_sources https
-        if ! apt-get "${apt_options[@]}" update; then
+        if ! clean_apt "${apt_options[@]}" update; then
             rm -f -- "$apt_sources"
             die "official Debian HTTPS still failed after CA/keyring bootstrap"
         fi
     fi
-    if ! apt-get "${apt_options[@]}" install -y --reinstall --no-install-recommends "${packages[@]}"; then
+    if ! clean_apt "${apt_options[@]}" install -y --reinstall --no-install-recommends "${packages[@]}"; then
         rm -f -- "$apt_sources"
         die "could not install preparation tools from official Debian repositories"
     fi
     rm -f -- "$apt_sources"
+    cleanup_apt_cache || die "preparation APT cache cleanup failed"
 }
 
 detect_architecture() {
@@ -256,6 +417,80 @@ resolve_root_disks() {
     fi
     lsblk -s -n -o KNAME,TYPE "$source" 2>/dev/null |
         awk '$2=="disk" {print $1}' | sort -u
+}
+
+resolve_path_disks() {
+    local path=$1 source major_minor
+    source="$(findmnt -n -o SOURCE -T "$path" 2>/dev/null || true)"
+    source=${source%%\[*}
+    if [ ! -b "$source" ]; then
+        major_minor="$(findmnt -n -o MAJ:MIN -T "$path" 2>/dev/null || true)"
+        if [ -n "$major_minor" ] && [ -e "/dev/block/$major_minor" ]; then
+            source="$(readlink -f -- "/dev/block/$major_minor")"
+        fi
+    fi
+    [ -b "$source" ] || return 1
+    lsblk -s -n -o KNAME,TYPE "$source" 2>/dev/null |
+        awk '$2=="disk" {print $1}' | sort -u
+}
+
+require_path_on_target_disk() {
+    local path=$1 label=$2 disks
+    disks="$(resolve_path_disks "$path" || true)"
+    [ -n "$disks" ] || die "could not resolve the disk backing $label ($path)"
+    [ "$(printf '%s\n' "$disks" | sed '/^$/d' | wc -l)" -eq 1 ] ||
+        die "$label spans multiple disks, which is not safe for unattended reinstall"
+    [ "$disks" = "${target_disk##*/}" ] ||
+        die "$label is on /dev/$disks but the root target is $target_disk; cross-disk boot layouts are not supported"
+}
+
+detect_boot_layout() {
+    local boot_options esp_mount path fstype abstraction env_path
+    esp_mount=
+    require_path_on_target_disk /boot '/boot filesystem'
+    boot_options="$(findmnt -n -o OPTIONS -T /boot 2>/dev/null || true)"
+    [[ ",$boot_options," == *,rw,* ]] || die "/boot is not mounted read-write"
+    [ -d /boot/grub ] || die "the source system does not have a standard Debian /boot/grub directory"
+    [ -s /boot/grub/grub.cfg ] || die "the source system has no usable /boot/grub/grub.cfg"
+    env_path=/boot/grub/grubenv
+    [ -f "$env_path" ] || die "GRUB environment block is missing"
+    require_path_on_target_disk "$env_path" 'GRUB environment block'
+    fstype="$(findmnt -n -o FSTYPE -T "$env_path")"
+    abstraction="$(grub-probe --target=abstraction "$env_path")" ||
+        die "could not identify GRUB environment storage"
+    # A grub-reboot value on LVM/Btrfs/RAID can remain selected forever.
+    # Refuse it, even if writing grubenv from the running Linux OS succeeds.
+    case "$fstype:$abstraction" in
+        ext2:|ext3:|ext4:) ;;
+        *) die "one-shot GRUB needs a plain ext2/3/4 boot filesystem (found $fstype/$abstraction); use a trusted rescue/ISO" ;;
+    esac
+
+    if [ -e /boot/grub2/grub.cfg ]; then
+        if [ /boot/grub/grub.cfg -ef /boot/grub2/grub.cfg ]; then
+            linked_grub_dir=true
+        elif [ "$(tr -d '\r\n' </boot/grub2/grub.cfg)" = 'chainloader (hd0)+1' ]; then
+            # Known CloudCone-style external GRUB layout: its grub2 config
+            # chainloads the disk MBR, whose Debian GRUB uses /boot/grub.
+            # Recreate grub2 as an alias after installation so repeat reinstalls
+            # retain both conventional lookup paths without copying old code.
+            linked_grub_dir=true
+        else
+            die "independent /boot/grub and /boot/grub2 configurations are ambiguous; refusing to guess the active loader"
+        fi
+    fi
+
+    if [ -d /sys/firmware/efi ]; then
+        for path in /boot/efi /efi /boot; do
+            if findmnt -rn -M "$path" >/dev/null 2>&1; then
+                fstype="$(findmnt -n -o FSTYPE -M "$path" 2>/dev/null || true)"
+                case "$fstype" in
+                    vfat|fat|msdos) esp_mount=$path; break ;;
+                esac
+            fi
+        done
+        [ -n "$esp_mount" ] || die "UEFI is active but no EFI System Partition is mounted at /boot/efi, /efi, or /boot"
+        require_path_on_target_disk "$esp_mount" 'EFI System Partition'
+    fi
 }
 
 select_target_disk() {
@@ -289,6 +524,10 @@ disk_facts() {
     local disk=$1 part
     disk_ptuuid="$(blkid -s PTUUID -o value "$disk" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
     disk_size="$(blockdev --getsize64 "$disk")"
+    [ "$(lsblk -dn -o RO "$disk" | tr -d '[:space:]')" = 0 ] ||
+        die "target disk is read-only: $disk"
+    [ "$disk_size" -ge "$MIN_DISK_BYTES" ] ||
+        die "target disk is smaller than the tested 4 GiB minimum: $disk_size bytes"
     part="$(lsblk -nrpo NAME,TYPE "$disk" | awk '$2=="part" && !found {print $1; found=1}')"
     disk_anchor_partuuid=
     if [ -n "$part" ]; then
@@ -340,21 +579,21 @@ route_token() {
 }
 
 collect_one_network() {
-    local family=$1 probe=$2 line dev src gateway addr mac all_addrs extras cfg id
-    line="$(ip -"$family" route get "$probe" 2>/dev/null | head -n 1 || true)"
-    [ -n "$line" ] || return 1
-    dev="$(route_token dev "$line")"
+    local family=$1 probe=$2 line dev src gateway addr mac all_addrs extras cfg id candidate
+    dev=; gateway=
+    # Select the underlying default NIC, not a probe-specific WARP/TUN route.
+    # Each multipath nexthop continuation is considered separately.
+    while IFS= read -r line; do
+        candidate="$(route_token dev "$line")"
+        [ -n "$candidate" ] && [ -e "/sys/class/net/$candidate/device" ] || continue
+        gateway="$(route_token via "$line")"
+        [ -n "$gateway" ] || continue
+        dev=$candidate
+        break
+    done < <(ip -"$family" route show table main default)
+    [ -n "$dev" ] || return 1
+    line="$(ip -"$family" route get "$probe" oif "$dev" 2>/dev/null | head -n 1 || true)"
     src="$(route_token src "$line")"
-    [ -n "$dev" ] && [ "$dev" != lo ] || return 1
-    [ -e "/sys/class/net/$dev/address" ] || return 1
-    # Bond/VLAN/tunnel recreation is intentionally refused instead of guessing.
-    [ -e "/sys/class/net/$dev/device" ] || die "default IPv$family route uses $dev, which is not a directly represented NIC"
-    # `ip route get` resolves policy routing and multipath routes to the exact
-    # nexthop selected for this probe.  Reading only the first line of
-    # `ip route show default` would miss providers that print `nexthop via ...`
-    # on indented continuation lines.
-    gateway="$(route_token via "$line")"
-    [ -n "$gateway" ] || return 1
     all_addrs="$(ip -"$family" -o addr show scope global dev "$dev" | awk '$0 !~ / temporary / {print $4}')"
     [ -n "$all_addrs" ] || return 1
     addr="$(printf '%s\n' "$all_addrs" | awk -F/ -v src="$src" '$1==src {print; exit}')"
@@ -386,7 +625,8 @@ collect_network() {
 }
 
 secure_curl() {
-    curl --fail --show-error --silent --location \
+    env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin curl -q --no-insecure \
+        --fail --show-error --silent --location \
         --proto '=https' --proto-redir '=https' --tlsv1.2 \
         --connect-timeout 15 --retry 3 --retry-delay 1 "$@"
 }
@@ -396,7 +636,11 @@ release_hash_line() {
     awk -v target="$relative" '
         $0 == "SHA256:" {inside=1; next}
         inside && /^[A-Za-z][A-Za-z0-9-]*:/ {inside=0}
-        inside && $3 == target {print $1, $2; exit}
+        inside && $3 == target {hash=$1; size=$2; count++}
+        END {
+            if (count != 1 || length(hash) != 64 || hash ~ /[^0-9a-fA-F]/ || size !~ /^[0-9]+$/) exit 1
+            print hash, size
+        }
     ' "$release_file"
 }
 
@@ -419,13 +663,14 @@ download_release_file() {
 
 load_signed_release() {
     local keyring=/usr/share/keyrings/debian-archive-keyring.gpg valid_until now expiry
-    release_file="$workdir/InRelease"
+    local signed_file="$workdir/InRelease"
+    release_file="$workdir/Release.verified"
     log "Downloading and verifying Debian $codename InRelease"
-    secure_curl --output "$release_file" "$mirror/dists/$codename/InRelease"
+    secure_curl --output "$signed_file" "$mirror/dists/$codename/InRelease"
     [ -r "$keyring" ] || die "Debian archive keyring not found: $keyring"
-    gpgv --keyring "$keyring" "$release_file" >/dev/null 2>&1 ||
+    gpgv --keyring "$keyring" --output "$release_file" "$signed_file" >/dev/null 2>&1 ||
         die "Debian InRelease signature verification failed"
-    grep -Fxq "Codename: $codename" "$release_file" || die "signed release codename mismatch"
+    [ "$(sed -n 's/^Codename: //p' "$release_file")" = "$codename" ] || die "signed release codename mismatch"
     valid_until="$(sed -n 's/^Valid-Until: //p' "$release_file" | head -n 1)"
     if [ -n "$valid_until" ]; then
         now="$(date +%s)"
@@ -531,7 +776,20 @@ get_ethx() {
     # 过滤 azure vf (带 master ethx)
     # 2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP qlen 1000\    link/ether 60:45:bd:21:8a:51 brd ff:ff:ff:ff:ff:ff
     # 3: eth1: <BROADCAST,MULTICAST,UP,LOWER_UP800> mtu 1500 qdisc mq master eth0 state UP qlen 1000\    link/ether 60:45:bd:21:8a:51 brd ff:ff:ff
-    ip -o link | grep -i "$mac_addr" | grep -v master | cut -d' ' -f2 | cut -d: -f1 | grep .
+    ip -o link | awk -v mac="$mac_addr" '
+        {
+            matched=0; slave=0
+            for (i=1;i<=NF;i++) {
+                if ($i=="master") slave=1
+                if ($i=="link/ether" && tolower($(i+1))==tolower(mac)) matched=1
+            }
+            if (matched && !slave) {
+                name=$2; sub(/:$/, "", name); sub(/@.*/, "", name)
+                count++; selected=name
+            }
+        }
+        END {if (count==1) print selected; else exit 1}
+    '
 }
 
 get_ipv4_gateway() {
@@ -662,7 +920,7 @@ test_connect() {
 }
 
 test_internet() {
-    for i in $(seq 5); do
+    for i in $(seq 2); do
         echo "Testing Internet Connection. Test $i... "
         if is_need_test_ipv4 &&
             current_ipv4_addr="$(get_first_ipv4_addr | remove_netmask)" &&
@@ -718,7 +976,7 @@ done
 
 if [ -z "$ethx" ]; then
     echo "Not found network card: $mac_addr"
-    exit
+    exit 1
 fi
 
 echo "Configuring $ethx ($mac_addr)..."
@@ -832,19 +1090,18 @@ if ! $ipv6_has_internet &&
     test_internet
 fi
 
-# 要删除不联网协议的ip，因为
-# 1 甲骨文云管理面板添加ipv6地址然后取消后，仍可能分配无出口的 IPv6
-# 2 有ipv4地址但没有ipv4网关的情况(vultr $2.5 ipv6 only)，aria2会用ipv4下载
-
-# 假设 ipv4 ipv6 在不同网卡，ipv4 能上网但 ipv6 不能上网，这时也要删除 ipv6
-# 不能用 ipv4_has_internet && ! ipv6_has_internet 判断，因为它判断的是同一个网卡
-if ! $ipv4_has_internet; then
+# A blocked probe endpoint is NOT evidence that an address family is invalid.
+# Preserve a complete address + default route, including captured static
+# settings. Only remove partial auto-configuration with no usable gateway.
+is_have_ipv4 && ipv4_configured=true || ipv4_configured=false
+is_have_ipv6 && ipv6_configured=true || ipv6_configured=false
+if ! $ipv4_configured; then
     if $dhcpv4; then
         should_disable_dhcpv4=true
     fi
     flush_ipv4_config
 fi
-if ! $ipv6_has_internet; then
+if ! $ipv6_configured; then
     # 防止删除 IPv6 后再次通过 SLAAC 获得
     # 不用判断 || $ra_has_gateway ，因为没有 IPv6 地址但有 IPv6 网关时，不会出现下载问题
     if $dhcpv6_or_slaac; then
@@ -871,6 +1128,11 @@ echo "$ipv6_gateway" >"$netconf/ipv6_gateway"
 echo "$ipv6_extra_addrs" >"$netconf/ipv6_extra_addrs"
 $ipv4_has_internet && echo 1 >"$netconf/ipv4_has_internet" || echo 0 >"$netconf/ipv4_has_internet"
 $ipv6_has_internet && echo 1 >"$netconf/ipv6_has_internet" || echo 0 >"$netconf/ipv6_has_internet"
+$ipv4_configured && echo 1 >"$netconf/ipv4_configured" || echo 0 >"$netconf/ipv4_configured"
+$ipv6_configured && echo 1 >"$netconf/ipv6_configured" || echo 0 >"$netconf/ipv6_configured"
+if { $ipv4_configured && ! $ipv4_has_internet; } || { $ipv6_configured && ! $ipv6_has_internet; }; then
+    echo 'Probe inconclusive: preserving complete IP/gateway configuration.' >&2
+fi
 
 # Never retain DNS learned from the provider. Rebuild atomically from all NICs
 # that have completed probing so an offline secondary NIC cannot erase the
@@ -881,8 +1143,8 @@ has_online_ipv4=false
 has_online_ipv6=false
 for state in /dev/netconf/*; do
     [ -d "$state" ] || continue
-    [ "$(cat "$state/ipv4_has_internet" 2>/dev/null)" = 1 ] && has_online_ipv4=true
-    [ "$(cat "$state/ipv6_has_internet" 2>/dev/null)" = 1 ] && has_online_ipv6=true
+    [ "$(cat "$state/ipv4_configured" 2>/dev/null)" = 1 ] && has_online_ipv4=true
+    [ "$(cat "$state/ipv6_configured" 2>/dev/null)" = 1 ] && has_online_ipv6=true
 done
 if $has_online_ipv4; then
     printf 'nameserver %s\nnameserver %s\n' "$ipv4_dns1" "$ipv4_dns2" >>"$resolver_tmp"
@@ -902,7 +1164,6 @@ set -e
 
 TRUE=0
 FALSE=1
-releasever="$(cat /configs/release 2>/dev/null || echo 13)"
 
 info() {
     printf '%s\n' "***** $* *****" >&2
@@ -913,13 +1174,13 @@ show_netconf() {
 }
 
 get_ra() {
-    if [ -z "${ra_loaded:-}" ]; then
+    # File-backed per-NIC cache survives command-substitution subshells.
+    ra_cache="/dev/netconf/$ethx/ra.txt"
+    if [ ! -f "$ra_cache" ]; then
         info "Gathering IPv6 router-advertisement information"
-        ra="$(rdisc6 -1 "$ethx" 2>/dev/null || true)"
-        ra_loaded=1
-        printf '%s\n' "$ra" >&2
-        show_netconf >&2
+        timeout 8 rdisc6 -1 "$ethx" >"$ra_cache" 2>/dev/null || true
     fi
+    ra="$(cat "$ra_cache")"
 }
 
 get_netconf() {
@@ -948,8 +1209,8 @@ get_netconf() {
     printf '%s' "$res"
 }
 
-is_ipv4_online() { [ "$(get_netconf ipv4_has_internet)" = 1 ]; }
-is_ipv6_online() { [ "$(get_netconf ipv6_has_internet)" = 1 ]; }
+is_ipv4_online() { [ "$(get_netconf ipv4_configured)" = 1 ]; }
+is_ipv6_online() { [ "$(get_netconf ipv6_configured)" = 1 ]; }
 disable_dhcpv4() { [ "$(get_netconf should_disable_dhcpv4)" = 1 ]; }
 disable_accept_ra() { [ "$(get_netconf should_disable_accept_ra)" = 1 ]; }
 disable_autoconf() { [ "$(get_netconf should_disable_autoconf)" = 1 ]; }
@@ -1067,11 +1328,7 @@ EOF
         elif is_dhcpv6; then
             # Debian 13's dhcpcd/ifupdown combination loses DHCPv4 when both
             # stanzas say dhcp. "auto" preserves SLAAC/DHCPv6 behavior.
-            if [ "$releasever" -ge 13 ]; then
-                echo "iface $ethx inet6 auto" >>"$conf_file"
-            else
-                echo "iface $ethx inet6 dhcp" >>"$conf_file"
-            fi
+            echo "iface $ethx inet6 auto" >>"$conf_file"
             has_ipv6_iface=true
         elif is_staticv6; then
             ipv6_addr="$(get_netconf ipv6_addr)"
@@ -1149,8 +1406,8 @@ __DEBIAN_REINSTALL_ASSET_debian_netcfg_sh__
 set -eu
 
 cfg=/configs/disk
-expected_ptuuid="$(tr '[:upper:]' '[:lower:]' <"$cfg/ptuuid" 2>/dev/null | sed 's/^0x//' || true)"
-expected_partuuid="$(tr '[:upper:]' '[:lower:]' <"$cfg/anchor_partuuid" 2>/dev/null || true)"
+expected_ptuuid="$(sed -e 'y/ABCDEF/abcdef/' -e 's/^0x//' "$cfg/ptuuid" 2>/dev/null || true)"
+expected_partuuid="$(sed 'y/ABCDEF/abcdef/' "$cfg/anchor_partuuid" 2>/dev/null || true)"
 expected_size="$(cat "$cfg/size_bytes")"
 
 disk_size() {
@@ -1168,7 +1425,7 @@ disk_id() {
             -e 's/^Disk identifier: *//p' \
             -e 's/^Disk identifier (GUID): *//p' | head -n 1)"
     fi
-    printf '%s' "$value" | tr '[:upper:]' '[:lower:]' | sed 's/^0x//'
+    printf '%s' "$value" | sed -e 'y/ABCDEF/abcdef/' -e 's/^0x//'
 }
 
 has_anchor_partuuid() {
@@ -1177,10 +1434,20 @@ has_anchor_partuuid() {
     for node in "/sys/block/$disk"/*; do
         [ -f "$node/partition" ] || continue
         part="$(basename "$node")"
-        if command -v blkid >/dev/null 2>&1; then
-            value="$(blkid -s PARTUUID -o value "/dev/$part" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-            [ "$value" = "$expected_partuuid" ] && return 0
+        part_number="$(cat "$node/partition")"
+        value=""
+        # Debian Installer's compact BusyBox blkid does not reliably report
+        # GPT PARTUUIDs.  fdisk-udeb is already added to the initrd, and its
+        # sfdisk handles MBR, GPT, virtio, NVMe and MMC partition naming alike.
+        if command -v sfdisk >/dev/null 2>&1; then
+            value="$(sfdisk --part-uuid "/dev/$disk" "$part_number" 2>/dev/null |
+                sed 'y/ABCDEF/abcdef/' || true)"
         fi
+        if [ -z "$value" ] && command -v blkid >/dev/null 2>&1; then
+            value="$(blkid -s PARTUUID -o value "/dev/$part" 2>/dev/null |
+                sed 'y/ABCDEF/abcdef/' || true)"
+        fi
+        [ "$value" = "$expected_partuuid" ] && return 0
     done
     return 1
 }
@@ -1205,6 +1472,13 @@ count="$(wc -l <"$candidate_file" | tr -d ' ')"
 if [ "$count" != 1 ]; then
     echo "Refusing to select an installation disk: expected one match, found $count." >&2
     echo "Expected PTUUID=$expected_ptuuid PARTUUID=$expected_partuuid SIZE=$expected_size" >&2
+    for path in /sys/block/*; do
+        disk="$(basename "$path")"
+        case "$disk" in
+            loop*|ram*|zram*|sr*|fd*|nbd*|dm-*|md*) continue ;;
+        esac
+        echo "Observed /dev/$disk: PTUUID=$(disk_id "$disk") SIZE=$(disk_size "$disk")" >&2
+    done
     sed 's/^/Candidate: \/dev\//' "$candidate_file" >&2 || true
     exit 1
 fi
@@ -1264,15 +1538,24 @@ cleanup_self() {
         /etc/systemd/system/fix-eth-name.service \
         /usr/local/lib/debian-reinstall/fix-eth-name.sh
     rmdir /usr/local/lib/debian-reinstall 2>/dev/null || true
+    rm -f /var/log/debian-reinstall-network-repair.error
 }
-trap cleanup_self EXIT
+
+fail() {
+    message=$1
+    printf '%s\n' "$message" >/var/log/debian-reinstall-network-repair.error
+    printf '%s\n' "$message" >&2
+    exit 1
+}
+
 trap 'exit 1' HUP INT TERM
 
 old_state=
 stable=0
 seen=false
+settled=false
 i=0
-while [ "$i" -lt 60 ]; do
+while [ "$i" -lt 90 ]; do
     i=$((i + 1))
     state="$(ip -o link | sed -n '/: lo:/!p')"
     [ -n "$state" ] && seen=true
@@ -1281,11 +1564,18 @@ while [ "$i" -lt 60 ]; do
     else
         stable=0
     fi
-    [ "$stable" -ge 5 ] && break
+    if [ "$stable" -ge 10 ]; then
+        settled=true
+        break
+    fi
     old_state=$state
+    if [ "$i" -eq 1 ] || [ $((i % 5)) -eq 0 ]; then
+        printf 'Waiting for stable network names: %ss, stable %s/10s\n' "$i" "$stable"
+    fi
     sleep 1
 done
-$seen || exit 1
+$seen || fail 'No network interface appeared during the first-boot repair window.'
+$settled || fail 'Network interface names did not remain stable for 10 seconds.'
 
 interface_for_mac() {
     wanted="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
@@ -1301,18 +1591,26 @@ interface_for_mac() {
 }
 
 file=/etc/network/interfaces
-[ -f "$file" ] || exit 0
+[ -f "$file" ] || fail 'The generated /etc/network/interfaces file is missing.'
 tmp="$file.debian-reinstall.tmp"
+trap 'rm -f "$tmp"' EXIT
 : >"$tmp"
 mapped=
+marker_count=0
+mapped_count=0
 
 while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
         '# mac '*)
+            marker_count=$((marker_count + 1))
             mac="${line##* }"
             matches="$(interface_for_mac "$mac" || true)"
             count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
-            [ "$count" = 1 ] && mapped="$matches" || mapped=
+            if [ "$count" != 1 ]; then
+                fail "Expected exactly one physical interface for MAC $mac, found $count."
+            fi
+            mapped="$matches"
+            mapped_count=$((mapped_count + 1))
             continue
             ;;
         'iface '*|'auto '*|'allow-hotplug '*)
@@ -1329,8 +1627,13 @@ while IFS= read -r line || [ -n "$line" ]; do
     printf '%s\n' "$line" >>"$tmp"
 done <"$file"
 
+[ "$marker_count" -gt 0 ] || fail 'No MAC markers were found in /etc/network/interfaces.'
+[ "$mapped_count" = "$marker_count" ] || fail 'Not every generated interface could be mapped by MAC address.'
+
 chmod --reference="$file" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
 mv "$tmp" "$file"
+trap - EXIT
+cleanup_self
 __DEBIAN_REINSTALL_ASSET_fix_eth_name_sh__
     cat >"$asset_root/fix-eth-name.service" <<'__DEBIAN_REINSTALL_ASSET_fix_eth_name_service__'
 [Unit]
@@ -1342,11 +1645,118 @@ Wants=network-pre.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=120
+StandardOutput=journal+console
+StandardError=journal+console
 ExecStart=/usr/local/lib/debian-reinstall/fix-eth-name.sh
 
 [Install]
 WantedBy=multi-user.target
 __DEBIAN_REINSTALL_ASSET_fix_eth_name_service__
+    cat >"$asset_root/fix-console.sh" <<'__DEBIAN_REINSTALL_ASSET_fix_console_sh__'
+#!/bin/sh
+# One-shot repair for a serial console that the installed kernel exposes but
+# the provider has not connected to a usable terminal.
+
+set -eu
+
+error_file=/var/log/debian-reinstall-console-repair.error
+script_file=/usr/local/lib/debian-reinstall/fix-console.sh
+unit_file=/etc/systemd/system/fix-console.service
+unit_link=/etc/systemd/system/multi-user.target.wants/fix-console.service
+
+cleanup_self() {
+    rm -f "$unit_link" "$unit_file" "$script_file" "$error_file"
+    rmdir /usr/local/lib/debian-reinstall 2>/dev/null || true
+}
+
+fail() {
+    message=$1
+    printf '%s\n' "$message" >"$error_file"
+    printf '%s\n' "$message" >&2
+    exit 1
+}
+
+trap 'exit 1' HUP INT TERM
+
+cmdline="$(cat /proc/cmdline)"
+bad_ttys=
+for tty in ttyS0 ttyAMA0; do
+    case " $cmdline " in
+        *" console=$tty"*)
+            if [ ! -c "/dev/$tty" ] ||
+                ! timeout 3 stty -g -F "/dev/$tty" >/dev/null 2>&1; then
+                bad_ttys="$bad_ttys $tty"
+            fi
+            ;;
+    esac
+done
+
+if [ -z "$bad_ttys" ]; then
+    cleanup_self
+    exit 0
+fi
+
+[ -f /etc/default/grub ] || fail 'Cannot repair an unusable serial console because /etc/default/grub is missing.'
+tmp=/etc/default/grub.debian-reinstall.tmp
+trap 'rm -f "$tmp"' EXIT
+cp -p /etc/default/grub "$tmp"
+
+for tty in $bad_ttys; do
+    # Debian Installer writes its added console arguments to GRUB_CMDLINE_LINUX.
+    # Remove only this exact serial-console token and retain every other option.
+    sed -E -i \
+        "s/(^|[[:space:]\"'])console=${tty}(,[^[:space:]\"']*)?/\\1/g" \
+        "$tmp"
+done
+sed -E -i \
+    '/^GRUB_CMDLINE_LINUX=/ { s/[[:space:]]+/ /g; s/="[[:space:]]*/="/; s/[[:space:]]+"$/"/; }' \
+    "$tmp"
+
+for tty in $bad_ttys; do
+    if grep -Eq "(^|[[:space:]\"'])console=${tty}([,[:space:]\"']|$)" "$tmp"; then
+        fail "Failed to remove the unusable $tty console from /etc/default/grub."
+    fi
+done
+mv "$tmp" /etc/default/grub
+trap - EXIT
+
+if ! update-grub; then
+    fail 'update-grub failed while removing an unusable serial console.'
+fi
+for tty in $bad_ttys; do
+    if grep -Eq "(^|[[:space:]\"'])console=${tty}([,[:space:]\"']|$)" \
+        /boot/grub/grub.cfg; then
+        fail "The regenerated GRUB configuration still contains the unusable $tty console."
+    fi
+    timeout 20 systemctl stop "serial-getty@$tty.service" ||
+        fail "Could not stop serial-getty@$tty.service; repair retained for diagnosis."
+    state="$(systemctl show "serial-getty@$tty.service" -p ActiveState --value)" ||
+        fail "Could not verify serial-getty@$tty.service stopped."
+    [ "$state" = inactive ] || fail "serial-getty@$tty.service is still $state."
+done
+
+cleanup_self
+__DEBIAN_REINSTALL_ASSET_fix_console_sh__
+    cat >"$asset_root/fix-console.service" <<'__DEBIAN_REINSTALL_ASSET_fix_console_service__'
+[Unit]
+Description=Validate Debian serial consoles after reinstall
+ConditionPathExists=/usr/local/lib/debian-reinstall/fix-console.sh
+Wants=systemd-udev-settle.service
+After=local-fs.target systemd-udev-settle.service
+Before=serial-getty@ttyS0.service serial-getty@ttyAMA0.service
+Before=network-pre.target networking.service network.target
+
+[Service]
+Type=oneshot
+TimeoutStartSec=120
+StandardOutput=journal+console
+StandardError=journal+console
+ExecStart=/usr/local/lib/debian-reinstall/fix-console.sh
+
+[Install]
+WantedBy=multi-user.target
+__DEBIAN_REINSTALL_ASSET_fix_console_service__
     cat >"$asset_root/installer-early.sh" <<'__DEBIAN_REINSTALL_ASSET_installer_early_sh__'
 #!/bin/sh
 
@@ -1371,20 +1781,74 @@ __DEBIAN_REINSTALL_ASSET_installer_early_sh__
 
 set -eu
 
-target_disk="$(/get-target-disk.sh)"
+partman_stage=initialization
+partman_ok=false
+report_partman_failure() {
+    rc=$?
+    if ! $partman_ok; then
+        message="installer-partman failed: stage=$partman_stage status=$rc"
+        printf '%s\n' "$message" >/var/log/debian-reinstall-partman.error 2>/dev/null || true
+        # /dev/console points only to the final console= argument. Mirror the
+        # error to every candidate so a provider serial console retains it
+        # even when tty0 is the primary console.
+        for output_device in /dev/console /dev/ttyS0 /dev/ttyAMA0 /dev/tty0; do
+            [ -c "$output_device" ] || continue
+            printf '%s\n' "$message" >"$output_device" 2>/dev/null || true
+        done
+    fi
+    return "$rc"
+}
+trap report_partman_failure EXIT
+trap 'exit 1' HUP INT TERM
+
+partman_stage=target-disk-identification
+target_disk_error=/tmp/debian-reinstall-target-disk.error
+if ! target_disk="$(/get-target-disk.sh 2>"$target_disk_error")"; then
+    while IFS= read -r message; do
+        for output_device in /dev/console /dev/ttyS0 /dev/ttyAMA0 /dev/tty0; do
+            [ -c "$output_device" ] || continue
+            printf '%s\n' "$message" >"$output_device" 2>/dev/null || true
+        done
+    done <"$target_disk_error"
+    exit 1
+fi
+rm -f "$target_disk_error"
+partman_stage=target-disk-selection
 debconf-set partman-auto/disk "$target_disk"
 debconf-set grub-installer/bootdev "$target_disk"
 
+partman_stage=partition-recipe
 if [ -d /sys/firmware/efi ]; then
     debconf-set partman-partitioning/default_label gpt
-    debconf-set partman-auto/expert_recipe "$(debconf-get partman-auto/expert_recipe_efi)"
+    recipe="$(debconf-get partman-auto/expert_recipe_efi 2>/dev/null || true)"
 else
-    debconf-set partman-auto/expert_recipe "$(debconf-get partman-auto/expert_recipe_bios)"
+    recipe="$(debconf-get partman-auto/expert_recipe_bios 2>/dev/null || true)"
 fi
+[ -n "$recipe" ] || {
+    printf '%s\n' 'The preseeded partition recipe is missing.' >/dev/console 2>/dev/null || true
+    exit 1
+}
+debconf-set partman-auto/expert_recipe "$recipe"
 
-console="$(cat /configs/console 2>/dev/null || true)"
+partman_stage=installed-kernel-options
+console="$(cat /configs/console_candidates)"
+# Recheck against the installer kernel, not just the merchant's old kernel.
+usable_console=
+for token in $console; do
+    case "$token" in
+        console=ttyS0*|console=ttyAMA0*)
+            tty=${token#console=}; tty=${tty%%,*}
+            if [ -c "/dev/$tty" ] && ! timeout 3 stty -g -F "/dev/$tty" >/dev/null 2>&1; then
+                continue
+            fi
+            ;;
+    esac
+    usable_console="${usable_console:+$usable_console }$token"
+done
+console=$usable_console
 [ -z "$console" ] || debconf-set debian-installer/add-kernel-opts "$console"
 
+partman_stage=installed-kernel-selection
 kernel_image="$(cat /configs/kernel_image)"
 debconf-set base-installer/kernel/image "$kernel_image"
 disk_name="${target_disk#/dev/}"
@@ -1392,6 +1856,7 @@ eths=""
 for path in /dev/netconf/*; do
     [ -d "$path" ] && eths="$eths $(basename "$path")"
 done
+partman_stage=cloud-kernel-compatibility
 # Interface names are intentionally passed as separate arguments.
 # shellcheck disable=SC2086
 if ! /can-use-cloud-kernel.sh "$disk_name" $eths; then
@@ -1399,36 +1864,83 @@ if ! /can-use-cloud-kernel.sh "$disk_name" $eths; then
     debconf-set base-installer/kernel/image "$generic"
 fi
 
-# Let base-installer use temporary swap when RAM is scarce. It is removed
-# before reboot and does not become part of the installed system.
+# Validate recipe and kernel selection before touching existing filesystems.
+# An equal-size ESP may otherwise be reused by partman without mkfs. Invalidate
+# at most the first 1 MiB of each confirmed old partition; never zero the disk.
+partman_stage=invalidate-old-filesystems
+target_disk_name="${target_disk#/dev/}"
+for partition_path in "/sys/block/$target_disk_name"/*; do
+    [ -f "$partition_path/partition" ] || continue
+    partition_name="$(basename "$partition_path")"
+    partition_sectors="$(cat "$partition_path/size")"
+    wipe_sectors=$partition_sectors
+    [ "$wipe_sectors" -le 2048 ] || wipe_sectors=2048
+    [ "$wipe_sectors" -gt 0 ] || continue
+    dd if=/dev/zero of="/dev/$partition_name" bs=512 count="$wipe_sectors" 2>/dev/null
+done
+sync
+
+# Wrap bootstrap-base only when the installer needs temporary swap or when an
+# EFI System Partition must be cleaned. Debian Installer can reuse an ESP
+# without formatting it when the new partition has the same size, so relying
+# on method{ efi } format{ } alone can retain files from the previous system.
 mem_mb="$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)"
-if [ "$mem_mb" -lt 768 ]; then
+partman_stage=bootstrap-wrapper
+need_bootstrap_wrapper=false
+[ "$mem_mb" -lt 768 ] && need_bootstrap_wrapper=true
+[ -d /sys/firmware/efi ] && need_bootstrap_wrapper=true
+if $need_bootstrap_wrapper; then
     postinst=/var/lib/dpkg/info/bootstrap-base.postinst
     if [ -f "$postinst" ] && [ ! -f "$postinst.debian-reinstall.orig" ]; then
         cp "$postinst" "$postinst.debian-reinstall.orig"
         cat >"$postinst" <<EOF
 #!/bin/sh
-swapfile=/target/.debian-installer-swap
-need_mb=$((768 - mem_mb))
-if command -v chattr >/dev/null 2>&1; then
-    touch "\$swapfile"
-    chattr +C "\$swapfile" 2>/dev/null || true
+set -eu
+
+if [ -d /sys/firmware/efi ]; then
+    esp=/target/boot/efi
+    if ! awk '\$2 == "/target/boot/efi" && (\$3 == "vfat" || \$3 == "fat") { found=1 } END { exit found ? 0 : 1 }' /proc/mounts; then
+        echo "EFI System Partition is not mounted at \$esp; refusing an installation that could retain old EFI files." >&2
+        exit 1
+    fi
+    find "\$esp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} \;
+    if find "\$esp" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        echo "Could not completely clean the EFI System Partition at \$esp." >&2
+        exit 1
+    fi
 fi
-if ! fallocate -l "\${need_mb}M" "\$swapfile" 2>/dev/null; then
-    dd if=/dev/zero of="\$swapfile" bs=1M count="\$need_mb"
+
+if [ $mem_mb -lt 768 ]; then
+    swapfile=/target/.debian-installer-swap
+    need_mb=$((768 - mem_mb))
+    if command -v chattr >/dev/null 2>&1; then
+        touch "\$swapfile"
+        chattr +C "\$swapfile" 2>/dev/null || true
+    fi
+    if ! fallocate -l "\${need_mb}M" "\$swapfile" 2>/dev/null; then
+        dd if=/dev/zero of="\$swapfile" bs=1M count="\$need_mb"
+    fi
+    chmod 0600 "\$swapfile"
+    if ! mkswap "\$swapfile" || ! swapon "\$swapfile"; then
+        rm -f "\$swapfile"
+        echo "Could not activate the temporary low-memory installer swap." >&2
+        exit 1
+    fi
 fi
-chmod 0600 "\$swapfile"
-mkswap "\$swapfile" && swapon "\$swapfile" || rm -f "\$swapfile"
+
 "$postinst.debian-reinstall.orig" "\$@"
 EOF
         chmod 0755 "$postinst"
-        mkdir -p /usr/lib/finish-install.d
-        cat >/usr/lib/finish-install.d/95-debian-reinstall-swap <<'EOF'
+        if [ "$mem_mb" -lt 768 ]; then
+            mkdir -p /usr/lib/finish-install.d
+            cat >/usr/lib/finish-install.d/95-debian-reinstall-swap <<'EOF'
 #!/bin/sh
-swapoff /target/.debian-installer-swap 2>/dev/null || true
+set -e
+swapoff /target/.debian-installer-swap
 rm -f /target/.debian-installer-swap
 EOF
-        chmod 0755 /usr/lib/finish-install.d/95-debian-reinstall-swap
+            chmod 0755 /usr/lib/finish-install.d/95-debian-reinstall-swap
+        fi
     fi
 fi
 
@@ -1437,6 +1949,10 @@ cat >/bin/os-prober <<'EOF'
 exit 0
 EOF
 chmod 0755 /bin/os-prober
+
+partman_stage=complete
+partman_ok=true
+rm -f /var/log/debian-reinstall-partman.error
 __DEBIAN_REINSTALL_ASSET_installer_partman_sh__
     cat >"$asset_root/installer-block-packages.sh" <<'__DEBIAN_REINSTALL_ASSET_installer_block_packages_sh__'
 #!/bin/sh
@@ -1449,7 +1965,7 @@ set -eu
 # Recommends from selecting packages outside the requested base + SSH target.
 mkdir -p /target/etc/apt/preferences.d
 cat >/target/etc/apt/preferences.d/99-debian-reinstall-block-extras <<'EOF'
-Package: qemu-guest-agent popularity-contest installation-report os-prober discover discover-data laptop-detect mouseemu xauth
+Package: qemu-guest-agent popularity-contest installation-report os-prober discover discover-data laptop-detect mouseemu xauth cloud-init cloud-initramfs-growroot walinuxagent waagent google-guest-agent google-compute-engine-oslogin amazon-ssm-agent oracle-cloud-agent open-vm-tools xe-guest-utilities aliyun-assist aliyun-service tat-agent
 Pin: version *
 Pin-Priority: -1
 EOF
@@ -1462,7 +1978,7 @@ set -eu
 late_stage=initialization
 late_status=1
 # Invoked indirectly by the EXIT trap below.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 record_late_failure() {
     rc=$?
     if [ "$late_status" != 0 ]; then
@@ -1479,10 +1995,6 @@ ssh_port="$(cat /configs/ssh_port)"
 hostname="$(cat /configs/hostname)"
 release="$(cat /configs/release)"
 case "$release" in
-    12)
-        codename=bookworm
-        archive_keyring=/usr/share/keyrings/debian-archive-keyring.gpg
-        ;;
     13)
         codename=trixie
         archive_keyring=/usr/share/keyrings/debian-archive-keyring.pgp
@@ -1492,7 +2004,7 @@ esac
 
 late_stage=apt-sources
 # Keep only Debian main. Debian 13 recommends deb822 sources with an explicit
-# archive keyring; Debian 12's APT supports the same format. Some d-i releases
+# archive keyring. Some d-i releases
 # add non-free-firmware despite the corresponding preseed setting being false,
 # so replace every generated source rather than editing it in place.
 rm -f /target/etc/apt/sources.list
@@ -1523,8 +2035,8 @@ has_ipv4=false
 has_ipv6=false
 for netconf in /dev/netconf/*; do
     [ -d "$netconf" ] || continue
-    [ "$(cat "$netconf/ipv4_has_internet" 2>/dev/null || true)" = 1 ] && has_ipv4=true
-    [ "$(cat "$netconf/ipv6_has_internet" 2>/dev/null || true)" = 1 ] && has_ipv6=true
+    [ "$(cat "$netconf/ipv4_configured" 2>/dev/null || true)" = 1 ] && has_ipv4=true
+    [ "$(cat "$netconf/ipv6_configured" 2>/dev/null || true)" = 1 ] && has_ipv6=true
 done
 $has_ipv4 || $has_ipv6 || exit 1
 
@@ -1559,14 +2071,36 @@ if [ -f /target/etc/dhcpcd.conf ]; then
         >>/target/etc/dhcpcd.conf
 fi
 
+late_stage=time-synchronization
+# Install via pkgsel, enable offline, and retain Debian's packaged defaults.
+# Do not start a target service in d-i or block unattended installation on NTP.
+in-target systemctl enable systemd-timesyncd.service
+in-target systemctl is-enabled --quiet systemd-timesyncd.service
+
 late_stage=network-repair-service
 mkdir -p /target/usr/local/lib/debian-reinstall /target/etc/systemd/system
 cp /fix-eth-name.sh /target/usr/local/lib/debian-reinstall/fix-eth-name.sh
 cp /fix-eth-name.service /target/etc/systemd/system/fix-eth-name.service
+cp /fix-console.sh /target/usr/local/lib/debian-reinstall/fix-console.sh
+cp /fix-console.service /target/etc/systemd/system/fix-console.service
 chmod 0755 /target/usr/local/lib/debian-reinstall/fix-eth-name.sh
-chmod 0644 /target/etc/systemd/system/fix-eth-name.service
+chmod 0755 /target/usr/local/lib/debian-reinstall/fix-console.sh
+chmod 0644 \
+    /target/etc/systemd/system/fix-eth-name.service \
+    /target/etc/systemd/system/fix-console.service
 in-target systemctl enable fix-eth-name.service
+in-target systemctl enable fix-console.service
 in-target systemctl enable ssh.service
+
+late_stage=ssh-generator-policy
+# Standard systemd administrator mask: keep the official binary/package intact,
+# but do not create AF_VSOCK/AF_UNIX or credential-requested SSH listeners.
+# This is persistent target policy, not a temporary installer artifact.
+generator_dir=/target/etc/systemd/system-generators
+mkdir -p "$generator_dir"
+chmod 0755 "$generator_dir"
+ln -sfn /dev/null "$generator_dir/systemd-ssh-generator"
+[ "$(readlink "$generator_dir/systemd-ssh-generator")" = /dev/null ]
 
 late_stage=ssh-configuration
 mkdir -p /target/etc/ssh/sshd_config.d
@@ -1586,6 +2120,8 @@ MaxStartups 10:30:60
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
+AllowStreamLocalForwarding no
+DisableForwarding yes
 GatewayPorts no
 PermitTunnel no
 PermitUserEnvironment no
@@ -1610,9 +2146,7 @@ sshd_effective_file=/target/run/debian-reinstall-sshd-effective
 # Debian 12's in-target may temporarily bind the installer's /run over the
 # target /run.  Recreate the privilege-separation directory after leaving the
 # wrapper so the direct chroot sees it as well.
-if [ "$release" = 12 ]; then
-    mkdir -p /target/run/sshd
-fi
+mkdir -p /target/run/sshd
 chroot /target /usr/sbin/sshd -T >"$sshd_effective_file"
 validate_sshd_setting() {
     late_stage="ssh-effective-validation-$1"
@@ -1626,6 +2160,8 @@ validate_sshd_setting empty-password 'permitemptypasswords no'
 validate_sshd_setting x11 'x11forwarding no'
 validate_sshd_setting agent-forward 'allowagentforwarding no'
 validate_sshd_setting tcp-forward 'allowtcpforwarding no'
+validate_sshd_setting streamlocal-forward 'allowstreamlocalforwarding no'
+validate_sshd_setting all-forwarding 'disableforwarding yes'
 rm -f "$sshd_effective_file"
 
 # Make hostname deterministic even when the provider's DHCP server sends
@@ -1645,9 +2181,44 @@ late_stage=network-configuration
 cp /etc/network/interfaces /target/etc/network/interfaces
 chmod 0600 /target/etc/network/interfaces
 
+# Do not carry the installer's transient DHCP client state into the first boot.
+# In particular, dhcpcd can report a truncated copied lease on Debian 13 even
+# though it immediately recovers. The installed client should negotiate a
+# fresh lease against the provider network instead.
+late_stage=network-lease-cleanup
+rm -f \
+    /target/var/lib/dhcpcd/*.lease \
+    /target/var/lib/dhcpcd/*.lease6 \
+    /target/var/lib/dhcp/dhclient*.leases \
+    /target/var/lib/dhcp/dhclient*.leases~
+
+# Some providers boot an external GRUB that looks for /boot/grub2/grub.cfg.
+# Preserve only the directory alias detected on the source system; no old GRUB
+# binary or configuration is copied into the new installation.
+late_stage=provider-grub-directory-compatibility
+if [ "$(cat /configs/link_grub_dir 2>/dev/null || echo 0)" = 1 ]; then
+    if [ -e /target/boot/grub2 ] || [ -L /target/boot/grub2 ]; then
+        [ /target/boot/grub2 -ef /target/boot/grub ] || exit 1
+    else
+        ln -s grub /target/boot/grub2
+    fi
+fi
+
+# finish-install's official 94save-logs hook otherwise copies the installer's
+# cdebconf database (including installation answers) into /var/log/installer.
+# Disable the copy after all installer components have been unpacked, so anna
+# cannot overwrite an earlier initrd-time patch. Normal target APT/dpkg logs
+# remain available; failures before successful completion remain diagnosable.
+late_stage=installer-archive-policy
+printf '#!/bin/sh\nexit 0\n' >/usr/lib/finish-install.d/94save-logs
+chmod 0755 /usr/lib/finish-install.d/94save-logs
+
 late_stage=complete
 late_status=0
 rm -f /target/var/log/debian-reinstall-late.error
+rm -f /target/var/log/debian-reinstall-partman.error
+rm -f /target/var/log/debian-reinstall-network-repair.error
+rm -f /target/var/log/debian-reinstall-console-repair.error
 exit 0
 __DEBIAN_REINSTALL_ASSET_installer_late_sh__
     cat >"$asset_root/installer-finish.sh" <<'__DEBIAN_REINSTALL_ASSET_installer_finish_sh__'
@@ -1656,29 +2227,60 @@ __DEBIAN_REINSTALL_ASSET_installer_late_sh__
 set -eu
 
 # These optional packages are blocked before apt can select them. Keep a final
-# defensive check because grub-installer runs late and has historically
-# installed os-prober explicitly. Purging here is an exceptional fallback, not
-# the normal minimal-install path.
-purge_packages=
+# defensive check because grub-installer runs late. Unexpected packages are
+# an installation failure, never a silently repaired success.
+error_file=/target/var/log/debian-reinstall-packages.error
+package_failure() {
+    printf '%s\n' "$1" >>"$error_file"
+    logger -t debian-reinstall-clean "$1" || true
+    exit 1
+}
+
+# Query once, directly: in-target logs stdout unless --pass-stdout is used.
+# Never interpret an unreadable/empty/partial inventory as "nothing installed".
+# The format must be passed literally to the target's official dpkg-query.
+# shellcheck disable=SC2016
+if ! inventory="$(chroot /target /usr/bin/dpkg-query -W \
+    -f='${Package}\t${db:Status-Status}\n' 2>"$error_file")"; then
+    package_failure 'Could not read the target package inventory.'
+fi
+if ! printf '%s\n' "$inventory" | awk -F '\t' '
+    NF!=2 || $1 !~ /^[a-z0-9][a-z0-9+.-]+$/ || seen[$1]++ ||
+    $2 !~ /^(not-installed|config-files|half-installed|unpacked|half-configured|triggers-awaited|triggers-pending|installed)$/ {bad=1}
+    END {exit (bad || NR<4) ? 1 : 0}
+'; then
+    package_failure 'The target package inventory is empty or malformed.'
+fi
+tab="$(printf '\t')"
+for required in base-files dpkg libc6 libc-bin openssh-server ca-certificates systemd-timesyncd; do
+    printf '%s\n' "$inventory" | grep -Fqx "${required}${tab}installed" ||
+        package_failure "Required installed package missing from inventory: $required"
+done
+
+unexpected_packages=
 for package in \
     qemu-guest-agent popularity-contest installation-report os-prober \
-    discover discover-data laptop-detect mouseemu xauth; do
-    # The dpkg-query format must be passed literally.
-    # shellcheck disable=SC2016
-    if in-target dpkg-query -W -f='${db:Status-Status}\n' "$package" 2>/dev/null |
-        grep -qx installed; then
-        purge_packages="$purge_packages $package"
-    fi
+    discover discover-data laptop-detect mouseemu xauth \
+    cloud-init cloud-initramfs-growroot walinuxagent waagent \
+    google-guest-agent google-compute-engine-oslogin amazon-ssm-agent \
+    oracle-cloud-agent open-vm-tools xe-guest-utilities \
+    aliyun-assist aliyun-service tat-agent; do
+    status="$(printf '%s\n' "$inventory" | awk -F '\t' -v wanted="$package" '$1==wanted {print $2}')"
+    case "$status" in
+        ''|not-installed) : ;;
+        *) unexpected_packages="$unexpected_packages $package($status)" ;;
+    esac
 done
-if [ -n "$purge_packages" ]; then
-    logger -t debian-reinstall-clean \
-        "blocked optional package unexpectedly installed; applying fallback purge:$purge_packages"
-    # The value is assembled exclusively from the fixed allow-list above.
-    # shellcheck disable=SC2086
-    in-target dpkg --purge $purge_packages
+if [ -n "$unexpected_packages" ]; then
+    package_failure "Unexpected optional packages:$unexpected_packages"
 fi
+rm -f "$error_file"
 rm -f /target/etc/apt/preferences.d/99-debian-reinstall-block-extras
 in-target apt-get clean
+# Remove only known installer archives if an earlier component created them.
+# Do not erase the new system's package-manager logs or normal journal.
+rm -rf /target/var/log/installer
+rm -f /target/var/log/bootstrap.log
 __DEBIAN_REINSTALL_ASSET_installer_finish_sh__
     cat >"$asset_root/preseed.cfg" <<'__DEBIAN_REINSTALL_ASSET_preseed_cfg__'
 d-i debian-installer/locale string en_US.UTF-8
@@ -1730,7 +2332,7 @@ d-i apt-setup/service-failed seen true
 d-i pkgsel/upgrade select safe-upgrade
 d-i pkgsel/install-language-support boolean false
 d-i pkgsel/run_tasksel boolean false
-d-i pkgsel/include string openssh-server ca-certificates
+d-i pkgsel/include string openssh-server ca-certificates systemd-timesyncd
 d-i popularity-contest/participate boolean false
 d-i grub-installer/force-efi-extra-removable boolean true
 d-i finish-install/reboot_in_progress note
@@ -1746,12 +2348,16 @@ __DEBIAN_REINSTALL_ASSET_preseed_cfg__
         "$asset_root/get-target-disk.sh" \
         "$asset_root/can-use-cloud-kernel.sh" \
         "$asset_root/fix-eth-name.sh" \
+        "$asset_root/fix-console.sh" \
         "$asset_root/installer-early.sh" \
         "$asset_root/installer-partman.sh" \
         "$asset_root/installer-block-packages.sh" \
         "$asset_root/installer-late.sh" \
         "$asset_root/installer-finish.sh"
-    chmod 0644 "$asset_root/fix-eth-name.service" "$asset_root/preseed.cfg"
+    chmod 0644 \
+        "$asset_root/fix-eth-name.service" \
+        "$asset_root/fix-console.service" \
+        "$asset_root/preseed.cfg"
 }
 
 extract_package_to() {
@@ -1798,6 +2404,14 @@ install_verified_udebs() {
     root="$workdir/fdisk-root"
     extract_package_to udeb fdisk-udeb "$root"
     merge_extracted_tree "$root" "$initrd_dir"
+    # Debian's minimal busybox-udeb does not provide timeout. Import ONLY the
+    # official utility, not the whole coreutils tree, through the same signed
+    # Packages hash chain. Its actual loader/dependencies are checked below.
+    log "Adding the verified Debian timeout utility for bounded installer probes"
+    root="$workdir/timeout-root"
+    extract_package_to deb coreutils "$root"
+    [ -x "$root/usr/bin/timeout" ] || die "official coreutils package has no timeout executable"
+    install -m 0755 "$root/usr/bin/timeout" "$initrd_dir/bin/timeout"
 }
 
 drivers_for_path() {
@@ -1900,20 +2514,60 @@ add_hyperv_pci_module_if_needed() {
     depmod -b "$initrd_dir" "$kver"
 }
 
+detect_console_cmdline() {
+    local candidates tty result=''
+
+    if [ "$arch" = arm64 ]; then
+        candidates='ttyS0 ttyAMA0 tty0'
+    else
+        candidates='ttyS0 tty0'
+    fi
+
+    # Some VPSes expose a character device for a disconnected or unusable
+    # virtual console.  Passing such a device to the installed kernel makes
+    # systemd continuously restart its getty.  Keep consoles that work in the
+    # current guest; also keep absent candidates because the installer/new
+    # Debian kernel can expose a console that the old vendor kernel omitted.
+    for tty in $candidates; do
+        if { [ -c "/dev/$tty" ] && timeout 3 stty -g -F "/dev/$tty" >/dev/null 2>&1; } ||
+            [ ! -c "/dev/$tty" ]; then
+            if [ -n "$result" ]; then
+                result="$result "
+            fi
+            case "$tty" in
+                ttyS0|ttyAMA0) result="${result}console=$tty,115200n8" ;;
+                *) result="${result}console=$tty" ;;
+            esac
+        else
+            log "Ignoring unusable virtual console /dev/$tty"
+        fi
+    done
+
+    printf '%s\n' "$result"
+}
+
 write_runtime_configs() {
+    local console_cmdline
+
     mkdir -p "$initrd_dir/configs/disk" "$initrd_dir/configs/net"
     printf '%s\n' "$release" >"$initrd_dir/configs/release"
     printf '%s\n' "$ssh_port" >"$initrd_dir/configs/ssh_port"
     printf '%s\n' "$new_hostname" >"$initrd_dir/configs/hostname"
     printf '%s\n' "$kernel_image" >"$initrd_dir/configs/kernel_image"
+    $linked_grub_dir && printf '1\n' >"$initrd_dir/configs/link_grub_dir" ||
+        printf '0\n' >"$initrd_dir/configs/link_grub_dir"
     printf '%s\n' "$disk_ptuuid" >"$initrd_dir/configs/disk/ptuuid"
     printf '%s\n' "$disk_anchor_partuuid" >"$initrd_dir/configs/disk/anchor_partuuid"
     printf '%s\n' "$disk_size" >"$initrd_dir/configs/disk/size_bytes"
+    console_cmdline="$(detect_console_cmdline)"
+    printf '%s\n' "$console_cmdline" >"$initrd_dir/configs/console"
+    # The installer kernel must independently probe every supported candidate,
+    # including devices that the vendor kernel incorrectly marked unusable.
     if [ "$arch" = arm64 ]; then
-        printf '%s\n' 'console=ttyS0,115200n8 console=ttyAMA0,115200n8 console=tty0' >"$initrd_dir/configs/console"
+        printf 'console=ttyS0,115200n8 console=ttyAMA0,115200n8 console=tty0\n'
     else
-        printf '%s\n' 'console=ttyS0,115200n8 console=tty0' >"$initrd_dir/configs/console"
-    fi
+        printf 'console=ttyS0,115200n8 console=tty0\n'
+    fi >"$initrd_dir/configs/console_candidates"
     printf '%s\n' "$password_hash" >"$initrd_dir/configs/password_hash"
     unset password_hash
     chmod -R go-rwx "$initrd_dir/configs"
@@ -1973,9 +2627,9 @@ change_priority() {
     while IFS= read -r line; do
         case "$line" in
             'Package: '*) package=${line#Package: } ;;
-            'Priority: standard')
+            'Priority: '*)
                 for item in $disabled_list; do
-                    if [ "$package" = "$item" ]; then
+                    if [ "$package" = "$item" ] && [ "$line" = 'Priority: standard' ]; then
                         line='Priority: optional'
                         break
                     fi
@@ -2050,17 +2704,22 @@ EOF
 }
 
 verify_initrd_contents() {
-    local required
+    local required timeout_rc=0
     for required in \
         preseed.cfg initrd-network.sh debian-network-render.sh debian-netcfg.sh \
         get-target-disk.sh can-use-cloud-kernel.sh installer-early.sh \
         installer-partman.sh installer-block-packages.sh installer-late.sh \
         installer-finish.sh \
-        fix-eth-name.sh fix-eth-name.service; do
+        fix-eth-name.sh fix-eth-name.service fix-console.sh fix-console.service; do
         [ -s "$initrd_dir/$required" ] || die "missing initrd asset: $required"
     done
     [ ! -e "$initrd_dir/usr/sbin/sshd" ] ||
         die "installer SSH is outside the reduced unattended-install scope"
+    [ -x "$initrd_dir/bin/timeout" ] || die "installer timeout utility is missing"
+    chroot "$initrd_dir" /bin/timeout 1 /bin/sh -c ':' ||
+        die "verified timeout cannot run with the installer's dynamic loader/libraries"
+    chroot "$initrd_dir" /bin/timeout 0.1 /bin/sh -c 'sleep 2' >/dev/null 2>&1 || timeout_rc=$?
+    [ "$timeout_rc" -eq 124 ] || die "installer timeout did not enforce its deadline (status $timeout_rc)"
     [ -x "$initrd_dir/usr/lib/finish-install.d/95-debian-reinstall-cleanup" ] ||
         die "final package-cleanup hook was not installed"
     [ -x "$initrd_dir/usr/lib/post-base-installer.d/10-debian-reinstall-block-extras" ] ||
@@ -2102,22 +2761,103 @@ grub_relative_path() {
     "$grub_mkrelpath" "$file"
 }
 
+disable_source_kexec_bypass() {
+    local tmp loaded
+
+    # Some provider Debian templates (notably some Tencent Cloud images) keep
+    # a kernel preloaded with kexec-tools. A normal reboot can then bypass the
+    # firmware and GRUB, so the verified one-shot entry would never run.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop kexec-load.service >/dev/null 2>&1 || true
+    fi
+    loaded="$(cat /sys/kernel/kexec_loaded 2>/dev/null || echo 0)"
+    if [ "$loaded" = 1 ]; then
+        command -v kexec >/dev/null 2>&1 ||
+            die "a kexec kernel is loaded but the kexec command is unavailable; unload it before reinstalling"
+        kexec -u || die "could not unload the source system's preloaded kexec kernel"
+        [ "$(cat /sys/kernel/kexec_loaded 2>/dev/null || echo 1)" = 0 ] ||
+            die "the source system still has a preloaded kexec kernel"
+    fi
+
+    if [ -f "$KEXEC_DEFAULT" ] &&
+        grep -Eq '^[[:space:]]*(export[[:space:]]+)?LOAD_KEXEC[[:space:]]*=' \
+            "$KEXEC_DEFAULT"; then
+        [ -f "$STATE_DIR/$KEXEC_BACKUP_NAME" ] ||
+            cp -p -- "$KEXEC_DEFAULT" "$STATE_DIR/$KEXEC_BACKUP_NAME"
+        tmp="$(mktemp "$KEXEC_DEFAULT.debian-reinstall.XXXXXXXX")"
+        awk '
+            /^[[:space:]]*(export[[:space:]]+)?LOAD_KEXEC[[:space:]]*=/ {
+                print "LOAD_KEXEC=false"
+                next
+            }
+            { print }
+        ' "$KEXEC_DEFAULT" >"$tmp"
+        chmod --reference="$KEXEC_DEFAULT" "$tmp" 2>/dev/null || chmod 0644 "$tmp"
+        chown --reference="$KEXEC_DEFAULT" "$tmp" 2>/dev/null || true
+        mv -- "$tmp" "$KEXEC_DEFAULT"
+        grep -Fqx 'LOAD_KEXEC=false' "$KEXEC_DEFAULT" ||
+            die "could not disable LOAD_KEXEC in the source system"
+        log "Temporarily disabled source-system kexec; --reset restores its original configuration"
+    fi
+}
+
 install_one_shot_boot() {
-    local update_grub grub_kernel grub_initrd
+    local update_grub grub_reboot grub_editenv grub_kernel grub_initrd
+    local boot_kib boot_available required_bytes active_cfg grub_script_check next_entry installer_console
+    local boot_uuid uuid_devices
     update_grub="$(find_grub_command update-grub || true)"
+    grub_reboot="$(find_grub_command grub-reboot grub2-reboot || true)"
+    grub_editenv="$(find_grub_command grub-editenv grub2-editenv || true)"
     [ -n "$update_grub" ] || die "a working Debian GRUB installation is required"
+    [ -n "$grub_reboot" ] || die "grub-reboot is required for a true one-shot installer boot"
+    [ -n "$grub_editenv" ] || die "grub-editenv is required to verify the one-shot installer boot"
     [ -d /etc/grub.d ] || die "/etc/grub.d is missing"
 
-    rm -rf -- "$STATE_DIR"
+    boot_kib="$(df -Pk /boot | awk 'NR == 2 {print $4}')"
+    [[ "$boot_kib" =~ ^[0-9]+$ ]] || die "could not determine free space on /boot"
+    boot_available=$((boot_kib * 1024))
+    required_bytes=$(($(stat -c %s "$workdir/linux") + $(stat -c %s "$workdir/initrd.patched.gz") + 33554432))
+    [ "$boot_available" -ge "$required_bytes" ] ||
+        die "not enough free space on /boot for the verified installer artifacts and safety margin"
+
+    [ ! -e "$STATE_DIR" ] && [ ! -e "$GRUB_SCRIPT" ] && [ ! -e "$GRUB_DEFAULT_DROPIN" ] ||
+        die "an earlier preparation exists; run --reset before preparing again"
+    next_entry="$("$grub_editenv" - list | sed -n 's/^next_entry=//p')"
+    [ -z "$next_entry" ] || die "another one-shot boot is already selected: $next_entry"
+    cp -p -- /boot/grub/grub.cfg "$workdir/grub.cfg.before"
+    boot_transaction=true
     mkdir -p "$STATE_DIR"
+    disable_source_kexec_bypass
     install -m 0600 "$workdir/linux" "$STATE_DIR/linux"
     install -m 0600 "$workdir/initrd.patched.gz" "$STATE_DIR/initrd.gz"
     grub_kernel="$(grub_relative_path "$STATE_DIR/linux")"
     grub_initrd="$(grub_relative_path "$STATE_DIR/initrd.gz")"
+    boot_uuid="$(findmnt -n -o UUID -T "$STATE_DIR/linux")"
+    [[ "$boot_uuid" =~ ^[0-9a-fA-F-]+$ ]] || die "installer boot filesystem has no valid UUID"
+    uuid_devices="$(blkid -c /dev/null -t "UUID=$boot_uuid" -o device)" ||
+        die "could not locate the installer boot filesystem UUID"
+    [ "$(printf '%s\n' "$uuid_devices" | wc -l)" -eq 1 ] ||
+        die "installer boot filesystem UUID is duplicated; refusing ambiguous boot"
+    installer_console="$(cat "$initrd_dir/configs/console")"
     [[ "$grub_kernel" = /* && "$grub_initrd" = /* ]] || die "GRUB returned unsafe artifact paths"
     cat >"$GRUB_SCRIPT" <<EOF
 #!/bin/sh
 cat <<'GRUBEOF'
+if [ -z "\${next_entry}" ]; then
+    for env_dir in /boot/grub /boot/grub2 /grub /grub2; do
+        set env_file="(\$root)\$env_dir/grubenv"
+        if [ -s "\$env_file" ]; then
+            load_env --file "\$env_file" next_entry
+            if [ -n "\${next_entry}" ]; then
+                set default="\${next_entry}"
+                set next_entry=
+                save_env --file "\$env_file" next_entry
+                break
+            fi
+        fi
+    done
+fi
+
 menuentry 'Debian $release secure unattended reinstall' --id debian-reinstall --unrestricted {
     insmod part_gpt
     insmod part_msdos
@@ -2127,8 +2867,8 @@ menuentry 'Debian $release secure unattended reinstall' --id debian-reinstall --
     insmod lvm
     insmod mdraid1x
     set btrfs_relative_path=n
-    search --no-floppy --file --set=root $grub_kernel
-    linux $grub_kernel lowmem/low=1 auto=true priority=critical preseed/file=/preseed.cfg mirror/http/hostname=$mirror_host mirror/http/directory=$mirror_directory base-installer/kernel/image=$kernel_image
+    search --no-floppy --fs-uuid --set=root $boot_uuid
+    linux $grub_kernel lowmem/low=1 auto=true priority=critical preseed/file=/preseed.cfg mirror/http/hostname=$mirror_host mirror/http/directory=$mirror_directory base-installer/kernel/image=$kernel_image $installer_console
     initrd $grub_initrd
 }
 GRUBEOF
@@ -2136,52 +2876,93 @@ EOF
     chmod 0755 "$GRUB_SCRIPT"
     mkdir -p "$(dirname "$GRUB_DEFAULT_DROPIN")"
     cat >"$GRUB_DEFAULT_DROPIN" <<'EOF'
-GRUB_DEFAULT=debian-reinstall
+GRUB_DEFAULT=saved
 GRUB_SAVEDEFAULT=false
 GRUB_TIMEOUT_STYLE=menu
 GRUB_TIMEOUT=5
 EOF
 
     "$update_grub"
+
+    active_cfg="$(readlink -f /boot/grub/grub.cfg)"
+    [ -s "$active_cfg" ] || die "update-grub did not produce a readable active configuration"
+    grep -Fq -- '--id debian-reinstall' "$active_cfg" ||
+        die "the active GRUB configuration does not contain the reinstall entry"
+    grub_script_check="$(find_grub_command grub-script-check grub2-script-check || true)"
+    if [ -n "$grub_script_check" ]; then
+        "$grub_script_check" "$active_cfg" >/dev/null
+    else
+        die "grub-script-check is required to validate the generated configuration"
+    fi
+    # Arm only after every artifact/configuration check. EXIT/signal rollback
+    # also covers a grub-reboot that writes successfully but returns failure.
+    "$grub_reboot" debian-reinstall
+    next_entry="$("$grub_editenv" - list 2>/dev/null |
+        sed -n 's/^next_entry=//p' | head -n 1)"
+    [ "$next_entry" = debian-reinstall ] ||
+        die "GRUB did not persist the one-shot reinstall selection"
+    sync
+    boot_committed=true
 }
 
-show_summary_and_confirm() {
+show_summary() {
+    display_heading 36 "Debian reinstall plan"
     cat >&2 <<EOF
+------------------------------------------------------------
+  Target system    : Debian $release ($codename, $arch)
+  Target disk      : $target_disk
+  Disk capacity    : $disk_size bytes
+  Disk PTUUID      : $disk_ptuuid
+  Root filesystem  : $filesystem
+  Boot mode        : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
 
-Target release : Debian $release ($codename, $arch)
-Target disk    : $target_disk
-Disk PTUUID    : $disk_ptuuid
-Disk size      : $disk_size bytes
-Network        : captured from current default IPv4/IPv6 routes
-Mirror         : $mirror (signed metadata and SHA-256 verified)
-Root FS        : $filesystem
-Authentication : $credential_kind
-Installer lowmem: Debian Installer automatic detection
-Temporary swap  : below 768 MiB during installation only
-Storage trim    : $low_memory_active
-Boot mode      : $([ -d /sys/firmware/efi ] && echo UEFI || echo BIOS)
+  Network          : captured from current default IPv4/IPv6 routes
+  Mirror           : $mirror
+  Verification     : signed metadata and SHA-256 verification required
+  Authentication   : $credential_kind
+
+  Installer lowmem : Debian Installer automatic detection
+  Temporary swap   : below 768 MiB during installation only
+  Storage trimming : $low_memory_active
+  Execution        : unattended preparation; reboot remains manual
+------------------------------------------------------------
 EOF
-    [ -t 0 ] || die "destructive confirmation requires an interactive terminal"
-    local answer expected="ERASE $target_disk"
-    printf 'Type exactly "%s" to prepare the destructive one-shot boot: ' "$expected" >&2
-    IFS= read -r answer
-    [ "$answer" = "$expected" ] || die "confirmation did not match; nothing installed"
+}
+
+show_completion() {
+    display_heading 32 "One-shot Debian reinstall is prepared; this script did not reboot"
+    cat >&2 <<EOF
+------------------------------------------------------------
+  The next boot will repartition $target_disk, format new filesystems,
+  and install Debian $release.
+  No SSH or HTTP management service is exposed while Debian Installer runs.
+
+  Cancel before reboot:
+    bash -- $(printf '%q' "$0") --reset
+
+  Start when ready:
+    systemctl reboot
+------------------------------------------------------------
+EOF
 }
 
 main() {
     require_root_debian
     validate_options
+    preflight_source_system
+    workdir="$(mktemp -d /var/tmp/debian-reinstall.XXXXXXXX)"
+    log "Work directory: $workdir"
     install_dependencies
+    require_secure_boot_disabled
     detect_architecture
     select_target_disk
     disk_facts "$target_disk"
     validate_disk_fingerprint_unique
+    detect_boot_layout
     prepare_credentials
     configure_memory_mode
-    show_summary_and_confirm
+    show_summary
 
-    workdir="$(mktemp -d /var/tmp/debian-reinstall.XXXXXXXX)"
-    log "Work directory: $workdir"
     load_signed_release
     load_package_indexes
     download_installer_images
@@ -2197,13 +2978,7 @@ main() {
     repack_initrd
     install_one_shot_boot
 
-    log "One-shot Debian reinstall is prepared; this script did not reboot"
-    cat >&2 <<EOF
-The next boot will repartition $target_disk, format new filesystems, and install Debian $release.
-No SSH or HTTP management service is exposed while Debian Installer runs.
-Cancel before reboot: $PROGRAM --reset
-Start when ready:     systemctl reboot
-EOF
+    show_completion
 }
 
 if [ "${DEBIAN_REINSTALL_LIBRARY_ONLY:-0}" != 1 ]; then
