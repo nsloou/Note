@@ -3101,8 +3101,21 @@ show_completion() {
     display_heading 32 "  ✓ 重装准备就绪                                      "
     cat >&2 <<EOF
 
-  输入重启命令开始安装：
-    systemctl reboot
+  重启后将自动安装全新 Debian ${release}，无需手动干预。
+  安装完成后，使用以下信息重新连接 SSH。
+
+  信息确认
+    目标系统 : Debian ${release}（${codename}，${arch}）
+    预选内核 : $kernel_image
+    登录用户 : root
+    SSH 端口 : $ssh_port
+    登录密码 : 已设置（不显示明文）
+
+  开始重装
+    reboot
+
+  撤销重装准备（仅限重启前）
+    bash -- $(printf '%q' "$0") --reset
 
 EOF
 }
