@@ -3101,19 +3101,8 @@ show_completion() {
     display_heading 32 "  ✓ 重装准备就绪                                      "
     cat >&2 <<EOF
 
-  尚未开始安装，系统不会自动重启。
-
-  下次启动将重新分区并格式化 ${target_disk}，
-  删除该盘原有数据，并安装 Debian ${release}。
-
-  重启后，当前 SSH 连接将断开。
-  安装期间不提供 SSH 或 HTTP 管理服务。
-
-  开始重装（立即重启）
+  输入重启命令开始安装：
     systemctl reboot
-
-  取消重装准备（仅限重启前）
-    bash -- $(printf '%q' "$0") --reset
 
 EOF
 }
