@@ -12,7 +12,11 @@
       "platform": "hongguo",
       "platformName": "红果短剧",
       "platformDescription": "红果短剧点播插件",
-      "zipURL": "请替换为可公开访问的 hongguo-1.1.1.zip 下载地址",
+      "zipURLs": [
+        "https://github.com/nsloou/Note/raw/refs/heads/master/age/hongguo-1.1.1.zip",
+        "https://raw.githubusercontent.com/nsloou/Note/master/age/hongguo-1.1.1.zip"
+      ],
+      "zipURL": "https://raw.githubusercontent.com/nsloou/Note/master/age/hongguo-1.1.1.zip",
       "sha256": "11c096f7fc031f7fe79fb235876be4e3cf07a0c1b0c6212728012b01c0f4227d"
     }
   ]
