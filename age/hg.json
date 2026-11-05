@@ -4,7 +4,7 @@
   "plugins": [
     {
       "pluginId": "hongguo",
-      "version": "1.1.1",
+      "version": "1.1.2",
       "changelog": [
         "修复首集播放未走完整回退链的问题；首集与手动选集统一使用相同的解析顺序",
         "修复首页多季聚合的中文季数解析（第十季、第二十季等）"
@@ -13,10 +13,10 @@
       "platformName": "红果短剧",
       "platformDescription": "红果短剧点播插件",
       "zipURLs": [
-        "https://github.com/nsloou/Note/raw/refs/heads/master/age/hongguo-1.1.1.zip",
-        "https://raw.githubusercontent.com/nsloou/Note/master/age/hongguo-1.1.1.zip"
+        "https://github.com/nsloou/Note/raw/refs/heads/master/age/hongguo-1.1.2.zip",
+        "https://raw.githubusercontent.com/nsloou/Note/master/age/hongguo-1.1.2.zip"
       ],
-      "zipURL": "https://raw.githubusercontent.com/nsloou/Note/master/age/hongguo-1.1.1.zip",
+      "zipURL": "https://raw.githubusercontent.com/nsloou/Note/master/age/hongguo-1.1.2.zip",
       "sha256": "11c096f7fc031f7fe79fb235876be4e3cf07a0c1b0c6212728012b01c0f4227d"
     }
   ]
